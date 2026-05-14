@@ -79,7 +79,7 @@ const DEFAULT_SETTINGS: Settings = {
     forwardToTelegram: true,
   },
   telegram: { token: "", allowedUserIds: [], listenChats: [], receiveEnabled: true, dmIsolation: "shared" },
-  discord: { token: "", allowedUserIds: [], listenChannels: [], listenGuilds: [], imageOutputRoots: [], streaming: false, maxChannelSessions: 5 },
+  discord: { token: "", allowedUserIds: [], listenChannels: [], listenGuilds: [], imageOutputRoots: [], streaming: false, maxChannelSessions: 5, memoChannels: [] },
   slack: { botToken: "", appToken: "", allowedUserIds: [], listenChannels: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
@@ -134,6 +134,9 @@ export interface DiscordConfig {
   streaming?: boolean; // When true, POST a live preview while Claude is working. Default: false.
   /** Maximum concurrent channel sessions (0 = unlimited). Default: 5. */
   maxChannelSessions: number;
+  /** Channel IDs designated as memo channels. Messages here are ingested directly
+   *  to Hindsight instead of starting a Claude conversation. */
+  memoChannels: string[];
 }
 
 export interface SlackConfig {
@@ -387,6 +390,9 @@ function parseSettings(
       maxChannelSessions: typeof raw.discord?.maxChannelSessions === "number" && raw.discord.maxChannelSessions >= 0
         ? raw.discord.maxChannelSessions
         : 5,
+      memoChannels: Array.isArray(raw.discord?.memoChannels)
+        ? raw.discord.memoChannels.map(String)
+        : [],
     },
     slack: {
       botToken: process.env.SLACK_BOT_TOKEN?.trim() || (typeof raw.slack?.botToken === "string" ? raw.slack.botToken.trim() : ""),
