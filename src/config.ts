@@ -79,7 +79,7 @@ const DEFAULT_SETTINGS: Settings = {
     forwardToTelegram: true,
   },
   telegram: { token: "", allowedUserIds: [], listenChats: [], receiveEnabled: true, dmIsolation: "shared" },
-  discord: { token: "", allowedUserIds: [], listenChannels: [], listenGuilds: [], imageOutputRoots: [], streaming: false },
+  discord: { token: "", allowedUserIds: [], listenChannels: [], listenGuilds: [], imageOutputRoots: [], streaming: false, maxChannelSessions: 5 },
   slack: { botToken: "", appToken: "", allowedUserIds: [], listenChannels: [] },
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
@@ -132,6 +132,8 @@ export interface DiscordConfig {
   channelNames?: Record<string, string>; // channelId -> friendly name for system prompt context
   imageOutputRoots: string[]; // Absolute path prefixes from which image uploads are permitted
   streaming?: boolean; // When true, POST a live preview while Claude is working. Default: false.
+  /** Maximum concurrent channel sessions (0 = unlimited). Default: 5. */
+  maxChannelSessions: number;
 }
 
 export interface SlackConfig {
@@ -382,6 +384,9 @@ function parseSettings(
         ? raw.discord.imageOutputRoots.filter((r: unknown) => typeof r === "string" && isAbsolute(r))
         : [],
       streaming: raw.discord?.streaming === true,
+      maxChannelSessions: typeof raw.discord?.maxChannelSessions === "number" && raw.discord.maxChannelSessions >= 0
+        ? raw.discord.maxChannelSessions
+        : 5,
     },
     slack: {
       botToken: process.env.SLACK_BOT_TOKEN?.trim() || (typeof raw.slack?.botToken === "string" ? raw.slack.botToken.trim() : ""),

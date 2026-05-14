@@ -1,9 +1,9 @@
-import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, compactCurrentThreadSession, agentDirKey } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, compactCurrentThreadSession, compactCurrentChannelSession, agentDirKey } from "../runner";
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
 import { getSettings, loadSettings, DEFAULT_IMAGE_OUTPUT_ROOT } from "../config";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
-import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
+import { listThreadSessions, removeThreadSession, peekThreadSession, getChannelSession, createChannelSession, removeChannelSession, peekChannelSession, countChannelSessions, clearAllSessions, listDiscordSessions } from "../sessionManager";
 import { readFile } from "node:fs/promises";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -75,6 +75,7 @@ interface DiscordMessage {
   message_snapshots?: [{ message: DiscordMessageSnapshot }];
   flags?: number;
   type: number;
+  thread_id?: string; // present when message is in a thread
 }
 
 interface DiscordInteraction {
@@ -83,6 +84,7 @@ interface DiscordInteraction {
   data?: {
     name?: string;
     custom_id?: string;
+    options?: Array<{ name: string; type: number; value?: string | number | boolean }>;
   };
   channel_id?: string;
   guild_id?: string;
@@ -560,7 +562,7 @@ async function registerSlashCommands(token: string): Promise<void> {
     },
     {
       name: "reset",
-      description: "Reset the global session for a fresh start",
+      description: "Reset the session for the current context",
       type: 1,
     },
     {
@@ -577,6 +579,19 @@ async function registerSlashCommands(token: string): Promise<void> {
       name: "context",
       description: "Show context window usage",
       type: 1,
+    },
+    {
+      name: "attach",
+      description: "Attach to an existing session by ID",
+      type: 1,
+      options: [
+        {
+          name: "session_id",
+          description: "The session UUID to attach to",
+          type: 3, // STRING
+          required: true,
+        },
+      ],
     },
   ];
 
@@ -1026,11 +1041,24 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
     }
 
     const prefixedPrompt = promptParts.join("\n");
-    // Guild channels (including threads) each get their own isolated session; DMs use the global session
-    const sessionKey = isGuild ? channelId : undefined;
+
+    // Route session based on context:
+    // 1. Thread (thread_id or known thread) → thread session
+    // 2. Listen channel (no thread) → channel session
+    // 3. DM (no guild_id) → global fallback
+    const isThreadCtx = !!(message.thread_id || threadInfo);
+    let sessionThreadId: string | undefined;
+    let sessionChannelId: string | undefined;
+
+    if (isThreadCtx) {
+      sessionThreadId = channelId;
+    } else if (isGuild && config.listenChannels.includes(channelId)) {
+      sessionChannelId = channelId;
+    }
+
     const requestStartedAt = Date.now();
-    if (sessionKey) {
-      const existing = await peekThreadSession(sessionKey);
+    if (sessionThreadId) {
+      const existing = await peekThreadSession(sessionThreadId);
       const globalSession = await peekSession();
       if (!existing && globalSession) {
         console.warn(
@@ -1039,6 +1067,19 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
         );
       }
     }
+
+    // Channel session cap enforcement: only when creating a NEW channel session
+    if (sessionChannelId) {
+      const existingChannel = await peekChannelSession(sessionChannelId);
+      if (!existingChannel) {
+        const count = await countChannelSessions();
+        if (config.maxChannelSessions > 0 && count >= config.maxChannelSessions) {
+          await sendMessage(config.token, channelId, "⚠️ Maximum channel sessions reached. Use `/reset` in an existing channel to free a slot.");
+          return;
+        }
+      }
+    }
+
     if (config.streaming) {
       streamCb = makeDiscordStreamCallback(config.token, channelId);
     }
@@ -1048,10 +1089,12 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
         return await runUserMessage(
           "discord",
           prefixedPrompt,
-          sessionKey,
+          sessionThreadId,
           threadInfo?.agentName,
           streamCb?.onChunk,
           streamCb?.onToolEvent,
+          undefined, // modelOverride
+          sessionChannelId,
         );
       } finally {
         if (streamCb) {
@@ -1112,26 +1155,48 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
     if (interaction.data.name === "reset") {
       const isGuildCmd = !!interaction.guild_id && !!interaction.channel_id;
       if (isGuildCmd) {
-        await removeThreadSession(interaction.channel_id!);
-        await resetFallbackSession(undefined, interaction.channel_id!);
+        const isThread = !!(await peekThreadSession(interaction.channel_id!));
+        const isChannel = !isThread && !!(await peekChannelSession(interaction.channel_id!));
+        if (isThread) {
+          await removeThreadSession(interaction.channel_id!);
+          await resetFallbackSession(undefined, interaction.channel_id!);
+        } else if (isChannel) {
+          await removeChannelSession(interaction.channel_id!);
+          await resetFallbackSession(undefined, interaction.channel_id!);
+        } else {
+          await respondToInteraction(interaction, { content: "No active session to reset." });
+          return;
+        }
       } else {
         await resetSession();
         await resetFallbackSession();
       }
       await respondToInteraction(interaction, {
-        content: isGuildCmd ? "Channel session reset. Next message starts fresh." : "Global session reset. Next message starts fresh.",
+        content: isGuildCmd ? "Session reset. Next message starts fresh." : "Global session reset. Next message starts fresh.",
       });
       return;
     }
 
     if (interaction.data.name === "compact") {
-      await respondToInteraction(interaction, { content: "⏳ Compacting session..." });
       const compactChannelId = interaction.channel_id;
       const compactThreadInfo = compactChannelId ? knownThreads.get(compactChannelId) : undefined;
       const isGuildCmd = !!interaction.guild_id && !!compactChannelId;
-      const result = isGuildCmd
-        ? await compactCurrentThreadSession(compactChannelId!, compactThreadInfo?.agentName)
-        : await compactCurrentSession();
+      let result: { success: boolean; message: string };
+      if (isGuildCmd) {
+        const isThread = !!(await peekThreadSession(compactChannelId!));
+        const isChannel = !isThread && !!(await peekChannelSession(compactChannelId!));
+        if (isThread) {
+          result = await compactCurrentThreadSession(compactChannelId!, compactThreadInfo?.agentName);
+        } else if (isChannel) {
+          result = await compactCurrentChannelSession(compactChannelId!);
+        } else {
+          await respondToInteraction(interaction, { content: "No active session to compact." });
+          return;
+        }
+      } else {
+        result = await compactCurrentSession();
+      }
+      await respondToInteraction(interaction, { content: "⏳ Compacting session..." });
       await fetch(
         `${DISCORD_API}/webhooks/${applicationId}/${interaction.token}/messages/@original`,
         {
@@ -1144,33 +1209,57 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
     }
 
     if (interaction.data.name === "status") {
-      const isGuildCmd = !!interaction.guild_id && !!interaction.channel_id;
-      const session = isGuildCmd
-        ? await peekThreadSession(interaction.channel_id!)
-        : await peekSession();
+      const statusChannelId = interaction.channel_id;
+      const isGuildCmd = !!interaction.guild_id && !!statusChannelId;
+      let session: { sessionId: string; turnCount?: number; compactWarned?: boolean; createdAt?: string; lastUsedAt?: string } | null = null;
+      let contextLabel = "Global";
+      if (isGuildCmd) {
+        const threadSess = await peekThreadSession(statusChannelId!);
+        const channelSess = await peekChannelSession(statusChannelId!);
+        if (threadSess) {
+          session = threadSess;
+          contextLabel = "Thread";
+        } else if (channelSess) {
+          session = channelSess;
+          contextLabel = "Channel";
+        }
+      } else {
+        session = await peekSession();
+      }
       const settings = getSettings();
       if (!session) {
         await respondToInteraction(interaction, { content: "📊 No active session." });
         return;
       }
-      const threadSessions = await listThreadSessions();
+      const discordSessions = await listDiscordSessions();
       const lines = [
         "📊 **Session Status**",
+        `Context: ${contextLabel}`,
         `Session: \`${session.sessionId.slice(0, 8)}\``,
-        `Turns: ${(session as any).turnCount ?? 0}`,
+        `Turns: ${session.turnCount ?? 0}`,
         `Model: ${settings.model || "default"}`,
         `Security: ${settings.security.level}`,
-        `Created: ${session.createdAt}`,
-        `Last used: ${session.lastUsedAt}`,
-        `Compact warned: ${(session as any).compactWarned ? "yes" : "no"}`,
+        ...(session.createdAt ? [`Created: ${session.createdAt}`] : []),
+        ...(session.lastUsedAt ? [`Last used: ${session.lastUsedAt}`] : []),
+        `Compact warned: ${session.compactWarned ? "yes" : "no"}`,
       ];
-      if (threadSessions.length > 0) {
-        lines.push("", `**Thread Sessions:** ${threadSessions.length}`);
-        for (const ts of threadSessions.slice(0, 5)) {
+      if (discordSessions.channels.length > 0) {
+        lines.push("", `**Channel Sessions:** ${discordSessions.channels.length}`);
+        for (const cs of discordSessions.channels.slice(0, 5)) {
+          const name = cs.channelName ? ` (${cs.channelName})` : "";
+          lines.push(`  Channel \`${cs.channelId.slice(0, 8)}\`${name} → Session \`${cs.sessionId.slice(0, 8)}\` (${cs.turnCount} turns)`);
+        }
+        if (discordSessions.channels.length > 5) {
+          lines.push(`  ... and ${discordSessions.channels.length - 5} more`);
+        }
+      }
+      if (discordSessions.threads.length > 0) {
+        lines.push("", `**Thread Sessions:** ${discordSessions.threads.length}`);
+        for (const ts of discordSessions.threads.slice(0, 5)) {
           lines.push(`  Thread \`${ts.threadId.slice(0, 8)}\` → Session \`${ts.sessionId.slice(0, 8)}\` (${ts.turnCount} turns)`);
         }
-        if (threadSessions.length > 5) {
-          lines.push(`  ... and ${threadSessions.length - 5} more`);
+        if (discordSessions.threads.length > 5) {
+          lines.push(`  ... and ${discordSessions.threads.length - 5} more`);
         }
       }
       await respondToInteraction(interaction, { content: lines.join("\n") });
@@ -1178,10 +1267,14 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
     }
 
     if (interaction.data.name === "context") {
-      const isGuildCmd = !!interaction.guild_id && !!interaction.channel_id;
-      const session = isGuildCmd
-        ? await peekThreadSession(interaction.channel_id!)
-        : await peekSession();
+      const ctxChannelId = interaction.channel_id;
+      const isGuildCmd = !!interaction.guild_id && !!ctxChannelId;
+      let session: { sessionId: string; turnCount?: number } | null = null;
+      if (isGuildCmd) {
+        session = await peekThreadSession(ctxChannelId!) ?? await peekChannelSession(ctxChannelId!);
+      } else {
+        session = await peekSession();
+      }
       if (!session) {
         await respondToInteraction(interaction, { content: "No active session." });
         return;
@@ -1227,12 +1320,47 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
           `├ Cache read: \`${cacheRead.toLocaleString()}\``,
           `└ Output (cumulative): \`${totalOutput.toLocaleString()}\``,
           ``,
-          `Turns: ${(session as any).turnCount ?? 0}`,
+          `Turns: ${session.turnCount ?? 0}`,
         ];
         await respondToInteraction(interaction, { content: msg.join("\n") });
       } catch (err) {
         await respondToInteraction(interaction, {
           content: `Failed to read context: ${err instanceof Error ? err.message : err}`,
+        });
+      }
+      return;
+    }
+
+    // /attach <session-id> — attach current context to an existing session
+    if (interaction.data.name === "attach") {
+      const attachChannelId = interaction.channel_id;
+      const isAttachGuild = !!interaction.guild_id && !!attachChannelId;
+      const sessionIdOpt = interaction.data.options?.find((o) => o.name === "session_id");
+      const sessionId = sessionIdOpt?.value;
+      if (!sessionId || typeof sessionId !== "string") {
+        await respondToInteraction(interaction, { content: "Usage: `/attach <session-uuid>`" });
+        return;
+      }
+      // Validate UUID format
+      const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      if (!UUID_RE.test(sessionId)) {
+        await respondToInteraction(interaction, { content: "❌ Invalid session ID. Must be a UUID." });
+        return;
+      }
+      if (isAttachGuild) {
+        const isThread = !!(await peekThreadSession(attachChannelId!));
+        if (isThread) {
+          await createThreadSession(attachChannelId!, sessionId);
+        } else {
+          const channelName = config.channelNames?.[attachChannelId!] ?? "";
+          await createChannelSession(attachChannelId!, sessionId, channelName);
+        }
+        await respondToInteraction(interaction, {
+          content: `✅ Attached to session \`${sessionId.slice(0, 8)}\` in this ${isThread ? "thread" : "channel"}.`,
+        });
+      } else {
+        await respondToInteraction(interaction, {
+          content: "❌ `/attach` is only supported in guild channels and threads.",
         });
       }
       return;
