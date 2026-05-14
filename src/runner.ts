@@ -1770,6 +1770,11 @@ const CLAUDE_SESSIONS_DIR = join(
   PROJECT_DIR.replace(/\//g, "-")
 );
 
+/** Check whether a Claude session has a local JSONL transcript file. */
+export function claudeSessionExists(sessionId: string): boolean {
+  return existsSync(join(CLAUDE_SESSIONS_DIR, `${sessionId}.jsonl`));
+}
+
 const FORK_SYSTEM_PROMPT = [
   "You are a FORK AGENT — a fast, lightweight watcher running in parallel with the main agent.",
   "",

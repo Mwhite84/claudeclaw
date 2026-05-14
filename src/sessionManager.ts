@@ -16,6 +16,8 @@ export interface ThreadSession {
   lastUsedAt: string;
   turnCount: number;
   compactWarned: boolean;
+  /** True if this session was created via /attach rather than organic conversation. */
+  attached?: boolean;
 }
 
 export interface ChannelSession {
@@ -27,6 +29,8 @@ export interface ChannelSession {
   lastUsedAt: string;
   turnCount: number;
   compactWarned: boolean;
+  /** True if this session was created via /attach rather than organic conversation. */
+  attached?: boolean;
 }
 
 interface SessionsData {
@@ -58,6 +62,7 @@ function migrate(raw: Record<string, unknown>): SessionsData {
         lastUsedAt: String(val.lastUsedAt ?? new Date().toISOString()),
         turnCount: typeof val.turnCount === "number" ? val.turnCount : 0,
         compactWarned: typeof val.compactWarned === "boolean" ? val.compactWarned : false,
+        ...(typeof val.attached === "boolean" ? { attached: val.attached } : {}),
       };
     }
   }
@@ -74,6 +79,7 @@ function migrate(raw: Record<string, unknown>): SessionsData {
         lastUsedAt: String(val.lastUsedAt ?? new Date().toISOString()),
         turnCount: typeof val.turnCount === "number" ? val.turnCount : 0,
         compactWarned: typeof val.compactWarned === "boolean" ? val.compactWarned : false,
+        ...(typeof val.attached === "boolean" ? { attached: val.attached } : {}),
       };
     }
   }
@@ -132,7 +138,7 @@ export async function getThreadSession(
 export async function createThreadSession(
   threadId: string,
   sessionId: string,
-  opts?: { parentChannelId?: string; channelName?: string },
+  opts?: { parentChannelId?: string; channelName?: string; attached?: boolean },
 ): Promise<void> {
   const data = await loadSessions();
   data.threads[threadId] = {
@@ -144,6 +150,7 @@ export async function createThreadSession(
     lastUsedAt: new Date().toISOString(),
     turnCount: 0,
     compactWarned: false,
+    ...(opts?.attached ? { attached: true } : {}),
   };
   await saveSessions(data);
 }
@@ -217,6 +224,7 @@ export async function createChannelSession(
   channelId: string,
   sessionId: string,
   channelName: string,
+  attached?: boolean,
 ): Promise<void> {
   const data = await loadSessions();
   data.channels[channelId] = {
@@ -227,6 +235,7 @@ export async function createChannelSession(
     lastUsedAt: new Date().toISOString(),
     turnCount: 0,
     compactWarned: false,
+    ...(attached ? { attached: true } : {}),
   };
   await saveSessions(data);
 }
