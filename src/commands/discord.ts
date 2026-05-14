@@ -12,7 +12,7 @@ import { resolveSkillPrompt } from "../skills";
 import { mkdir } from "node:fs/promises";
 import { extname, join, basename, sep } from "node:path";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
-import { flushSessionToHindsight, retain, type FlushMetadata } from "../hindsight";
+import { flushSessionToHindsight, retain, getProjectSlug, type FlushMetadata } from "../hindsight";
 
 // --- Discord API constants ---
 
@@ -485,44 +485,41 @@ interface ThreadIntent {
   names: string[];
 }
 
-async function classifyThreadIntent(text: string): Promise<ThreadIntent | null> {
-  const systemPrompt = `You classify user messages into thread management intents.
+// Regex-based intent classifier — instant, no subprocess, no event loop blocking.
+// Matches English hire/fire keywords and Chinese equivalents from the original prompt.
+const HIRE_PATTERN = /^(?:hire|spawn|deploy|派出?|叫.+出來|開|建立|出征|上陣|迎戰|出戰)\s+(.+)/i;
+const FIRE_PATTERN = /^(?:fire|kill|remove|delete|撤回?|收回|叫.+回來|刪|關|滾)\s+(.+)/i;
 
-If the user wants to CREATE/SPAWN/DEPLOY threads (e.g. "hire X", "派出 X", "叫 X 出來", "派 X 去打", "開 X", "建立 X"):
-Return: {"action":"hire","names":["name1","name2"]}
+// Well-known group expansions (Chinese literary/historical groups)
+const GROUP_EXPANSIONS: Record<string, string[]> = {
+  "桃園三結義": ["劉備", "關羽", "張飛"],
+  "五虎將": ["關羽", "張飛", "趙雲", "馬超", "黃忠"],
+};
 
-If the user wants to DELETE/REMOVE threads (e.g. "fire X", "撤回 X", "把 X 叫回來", "刪 X", "關 X"):
-Return: {"action":"fire","names":["name1","name2"]}
+function classifyThreadIntent(text: string): ThreadIntent | null {
+  const trimmed = text.trim();
 
-If the message is NOT about thread management, return: null
-
-Rules:
-- Extract individual names. "桃園三結義" = ["劉備","關羽","張飛"]. "五虎將" = ["關羽","張飛","趙雲","馬超","黃忠"].
-- Common patterns: 派/派出/出征/上陣/迎戰/出戰 = hire. 撤/撤回/收回/叫回來/滾 = fire.
-- Return ONLY valid JSON or the word null. No explanation.`;
-
-  try {
-    const { execSync } = await import("node:child_process");
-    const input = `${systemPrompt}\n\n---\nUser message: ${text}`;
-    const result = execSync(
-      `claude --model claude-sonnet-4-20250514 --print --output-format text`,
-      {
-        input,
-        encoding: "utf-8",
-        timeout: 15000,
-        env: { ...process.env, HOME: homedir() },
-      },
-    ).trim();
-
-    if (!result || result === "null") return null;
-    // Extract JSON from response (in case there's extra text)
-    const jsonMatch = result.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return null;
-    return JSON.parse(jsonMatch[0]) as ThreadIntent;
-  } catch (err) {
-    console.error(`[Discord] Intent classifier error: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
+  // Check group expansions first
+  for (const [group, names] of Object.entries(GROUP_EXPANSIONS)) {
+    if (trimmed.includes(group)) {
+      const isHire = HIRE_PATTERN.test(trimmed) || /派|出征|上陣|hire|spawn/i.test(trimmed);
+      return { action: isHire ? "hire" : "fire", names };
+    }
   }
+
+  const hireMatch = trimmed.match(HIRE_PATTERN);
+  if (hireMatch) {
+    const names = hireMatch[1].split(/[,，、\s]+/).map(n => n.trim()).filter(Boolean);
+    if (names.length > 0) return { action: "hire", names };
+  }
+
+  const fireMatch = trimmed.match(FIRE_PATTERN);
+  if (fireMatch) {
+    const names = fireMatch[1].split(/[,，、\s]+/).map(n => n.trim()).filter(Boolean);
+    if (names.length > 0) return { action: "fire", names };
+  }
+
+  return null;
 }
 
 // --- Attachment handling (original) ---
@@ -985,8 +982,9 @@ async function handleMemoChannelMessage(
           type: voiceTranscript ? (textParts.length > 0 ? "voice+text" : "voice") : "text",
         },
         tags: ["claudeclaw", "discord", "memo"],
+        strategy: "personal-note",
       },
-    ]);
+    ], { sync: true });
 
     if (!result.ok) {
       console.warn(`[memo] Hindsight retain failed: ${result.error}`);
@@ -1013,8 +1011,9 @@ const pendingForwards = new Map<string, { snapshot: DiscordMessageSnapshot; time
 async function handleMessageCreate(token: string, message: DiscordMessage, skipCoalesce = false): Promise<void> {
   const config = getSettings().discord;
 
-  // Ignore bot messages
+  // Ignore bot messages and system thread-creation notifications (type 21)
   if (message.author.bot) return;
+  if (message.type === 21) return;
 
   const userId = message.author.id;
   const channelId = message.channel_id;
@@ -1182,8 +1181,10 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
     }
 
     // --- Thread management: AI-powered intent classification ---
-    if (isGuild && cleanContent.length < 200) {
-      const intent = await classifyThreadIntent(cleanContent);
+    // Skip for thread messages — threads already have isolated sessions, no sub-thread spawning.
+    // Also avoids execSync blocking the event loop during thread conversations.
+    if (isGuild && !threadInfo && cleanContent.length < 200) {
+      const intent = classifyThreadIntent(cleanContent);
       if (intent && intent.action === "hire" && intent.names.length > 0) {
         const results: string[] = [];
         for (const threadName of intent.names) {
@@ -1195,7 +1196,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
               {
                 name: threadName,
                 type: 11, // PUBLIC_THREAD
-                auto_archive_duration: 4320, // 3 days
+                auto_archive_duration: 10080, // 7 days (Discord maximum)
               },
             );
             upsertThread(thread.id, channelId, threadName);
@@ -1664,7 +1665,7 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
         return;
       }
       const home = homedir();
-      const projectSlug = process.cwd().replace(/\//g, "-");
+      const projectSlug = getProjectSlug();
       const jsonlPath = `${home}/.claude/projects/${projectSlug}/${session.sessionId}.jsonl`;
       if (!existsSync(jsonlPath)) {
         await respondToInteraction(interaction, { content: "Conversation file not found." });
@@ -2077,11 +2078,30 @@ function handleDispatch(token: string, eventName: string, data: any): void {
     case "THREAD_UPDATE":
       if (data.id && data.parent_id) {
         if (data.thread_metadata?.archived) {
-          knownThreads.delete(data.id);
-          removeThreadSession(data.id).catch((err) =>
-            console.error(`[Discord] Failed to cleanup archived thread session: ${err}`),
-          );
-          debugLog(`Thread archived and cleaned up: ${data.id}`);
+          // If an active session exists for this thread, unarchive it instead of deleting the session.
+          // Deleting the session on archive is the root cause of the thread dropout bug.
+          peekThreadSession(data.id)
+            .catch(() => null)
+            .then((activeSession) => {
+              if (activeSession) {
+                discordApi(token, "PATCH", `/channels/${data.id}`, {
+                  archived: false,
+                  auto_archive_duration: 10080,
+                })
+                  .then(() => {
+                    upsertThread(data.id, data.parent_id, data.name);
+                    debugLog(`Thread ${data.id} unarchived to preserve active session`);
+                  })
+                  .catch((err) => {
+                    console.error(`[Discord] Failed to unarchive thread ${data.id}: ${err} — cleaning up session`);
+                    knownThreads.delete(data.id);
+                    removeThreadSession(data.id).catch(() => {});
+                  });
+              } else {
+                knownThreads.delete(data.id);
+                debugLog(`Thread archived (no active session): ${data.id}`);
+              }
+            });
         } else {
           upsertThread(data.id, data.parent_id, data.name);
         }
