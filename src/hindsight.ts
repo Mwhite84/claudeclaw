@@ -11,6 +11,10 @@
  */
 
 import type { HindsightConfig } from "./config";
+import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -286,4 +290,168 @@ function escapeAttr(s: string): string {
     .replace(/"/g, "&quot;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+
+// ── Session flush ────────────────────────────────────────────────────────────
+
+/** Metadata describing a session to flush. */
+export interface FlushMetadata {
+  /** Claude session UUID. */
+  sessionId: string;
+  /** ISO-8601 timestamp of when the session was created. */
+  createdAt?: string;
+  /** Human-readable context label (e.g. "discord:#general", "discord thread:abc123"). */
+  contextLabel?: string;
+  /** Source surface (e.g. "discord"). */
+  surface?: string;
+  /** Discord channel ID, thread ID, or other scope identifier. */
+  scopeId?: string;
+  /** Channel name (may be empty). */
+  channelName?: string;
+  /** Author username (when available). */
+  author?: string;
+}
+
+/** Return type for the flush helper. */
+export interface FlushOutcome {
+  ok: boolean;
+  /** Number of memory items sent. */
+  itemsSent: number;
+  /** Non-empty when ok is false. */
+  error?: string;
+}
+
+/**
+ * Resolve the JSONL transcript path for a Claude session.
+ *
+ * Claude Code stores transcripts under:
+ *   ~/.claude/projects/<slug>/<sessionId>.jsonl
+ * where slug is the project dir with `/` replaced by `-`.
+ */
+function sessionTranscriptPath(sessionId: string): string {
+  const home = homedir();
+  const projectSlug = process.cwd().replace(/\//g, "-");
+  return join(home, ".claude", "projects", projectSlug, `${sessionId}.jsonl`);
+}
+
+/**
+ * Extract the conversation text from a Claude JSONL transcript file.
+ *
+ * Reads the JSONL file line by line, collects assistant text blocks,
+ * and returns them concatenated with role markers.
+ * Returns null if the file doesn't exist or can't be parsed.
+ */
+async function readTranscript(
+  sessionId: string,
+): Promise<string | null> {
+  const jsonlPath = sessionTranscriptPath(sessionId);
+  if (!existsSync(jsonlPath)) return null;
+
+  try {
+    const raw = await readFile(jsonlPath, "utf8");
+    const lines = raw.trim().split("\n");
+    const parts: string[] = [];
+
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line);
+        if (obj.type === "assistant" && obj.message?.content) {
+          for (const block of obj.message.content) {
+            if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
+              parts.push(`[assistant]: ${block.text.trim()}`);
+            }
+          }
+        } else if (obj.type === "user" && obj.message?.content) {
+          for (const block of obj.message.content) {
+            if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
+              parts.push(`[user]: ${block.text.trim()}`);
+            }
+          }
+        }
+      } catch {
+        // skip malformed lines
+      }
+    }
+
+    return parts.length > 0 ? parts.join("\n\n") : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Flush a session transcript to Hindsight.
+ *
+ * Reads the Claude JSONL transcript for the given session, constructs a retain
+ * payload with metadata, and sends it via the retain endpoint with `async: true`.
+ *
+ * If Hindsight is disabled or the transcript doesn't exist, returns `{ ok: true, itemsSent: 0 }`.
+ * Flush failure does NOT block session operations — callers should log the error
+ * and continue.
+ */
+export async function flushSessionToHindsight(
+  cfg: HindsightConfig,
+  meta: FlushMetadata,
+): Promise<FlushOutcome> {
+  if (!isEnabled(cfg)) return { ok: true, itemsSent: 0 };
+
+  const transcript = await readTranscript(meta.sessionId);
+  if (!transcript) {
+    console.log(`[hindsight] No transcript found for session ${meta.sessionId.slice(0, 8)}; skipping flush`);
+    return { ok: true, itemsSent: 0 };
+  }
+
+  const tags: string[] = ["claudeclaw"];
+  if (meta.surface) tags.push(meta.surface);
+  if (meta.scopeId) tags.push(`scope:${meta.scopeId}`);
+
+  const item: RetainItem = {
+    content: transcript.slice(0, 100_000), // cap at 100KB to avoid oversized payloads
+    context: meta.contextLabel ?? "claudeclaw:session",
+    document_id: meta.sessionId,
+    timestamp: meta.createdAt ?? new Date().toISOString(),
+    metadata: {
+      sessionId: meta.sessionId,
+      ...(meta.surface ? { surface: meta.surface } : {}),
+      ...(meta.scopeId ? { scopeId: meta.scopeId } : {}),
+      ...(meta.channelName ? { channelName: meta.channelName } : {}),
+      ...(meta.author ? { author: meta.author } : {}),
+    },
+    tags,
+  };
+
+  const result = await retain(cfg, [item]);
+  if (result.ok) {
+    console.log(`[hindsight] Flushed session ${meta.sessionId.slice(0, 8)} to Hindsight`);
+  }
+  return { ok: result.ok, itemsSent: result.ok ? 1 : 0, error: result.error };
+}
+
+// ── Substantive message detection ────────────────────────────────────────────
+
+/** Patterns that indicate a non-substantive message (emoji, noise, control commands). */
+const NOISE_PATTERNS = /^[\p{Emoji_Presentation}\p{Emoji_Component}\s!?.…·\-–—_~*/\\]+$/u;
+
+/**
+ * Determine whether a message is substantive enough to trigger a Hindsight recall.
+ *
+ * A message is substantive when it:
+ * - Is not empty after mention stripping
+ * - Is not only emoji/noise
+ * - Is not a control command (starts with /)
+ * - Contains a non-trivial voice transcript or text
+ */
+export function isSubstantive(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+
+  // Control commands don't trigger recall
+  if (trimmed.startsWith("/")) return false;
+
+  // Pure emoji/noise
+  if (NOISE_PATTERNS.test(trimmed)) return false;
+
+  // Must have at least one word character or meaningful content
+  // (voice transcripts will have words, text will have words)
+  return /\w{2,}/u.test(trimmed) || trimmed.length >= 5;
 }

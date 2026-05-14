@@ -1,5 +1,15 @@
 import { describe, test, expect } from "bun:test";
-import { formatMemories, type RecallResultItem } from "../hindsight";
+import { formatMemories, isSubstantive, flushSessionToHindsight, type RecallResultItem, type FlushMetadata } from "../hindsight";
+import type { HindsightConfig } from "../config";
+
+const disabledCfg: HindsightConfig = {
+  baseUrl: "",
+  token: "",
+  bankId: "",
+  recallMaxItems: 5,
+  recallMaxChars: 4000,
+  timeoutMs: 5000,
+};
 
 describe("formatMemories", () => {
   test("returns empty string for empty input", () => {
@@ -104,5 +114,77 @@ describe("formatMemories", () => {
     expect(result).toMatch(/<\/hindsight_memories>$/);
     expect(result).toContain("User prefers dark mode");
     expect(result).toContain("User is in PST timezone");
+  });
+});
+
+describe("isSubstantive", () => {
+  test("returns false for empty string", () => {
+    expect(isSubstantive("")).toBe(false);
+  });
+
+  test("returns false for whitespace only", () => {
+    expect(isSubstantive("   ")).toBe(false);
+  });
+
+  test("returns false for control commands", () => {
+    expect(isSubstantive("/reset")).toBe(false);
+    expect(isSubstantive("/compact")).toBe(false);
+    expect(isSubstantive("/status")).toBe(false);
+  });
+
+  test("returns false for pure emoji", () => {
+    expect(isSubstantive("👍")).toBe(false);
+    expect(isSubstantive("🎉 🎊")).toBe(false);
+  });
+
+  test("returns true for normal text", () => {
+    expect(isSubstantive("Hello, how are you?")).toBe(true);
+  });
+
+  test("returns true for text with emoji", () => {
+    expect(isSubstantive("Check this out 🚀")).toBe(true);
+  });
+
+  test("returns true for voice transcript", () => {
+    expect(isSubstantive("Voice transcript: I was working on the API endpoint")).toBe(true);
+  });
+
+  test("returns true for short meaningful content", () => {
+    expect(isSubstantive("yes")).toBe(true);
+  });
+
+  test("returns false for single punctuation", () => {
+    expect(isSubstantive("?")).toBe(false);
+    expect(isSubstantive("!")).toBe(false);
+  });
+
+  test("returns true for longer text", () => {
+    expect(isSubstantive("Can you help me debug the authentication flow?")).toBe(true);
+  });
+});
+
+describe("flushSessionToHindsight", () => {
+  test("returns ok when Hindsight is disabled", async () => {
+    const result = await flushSessionToHindsight(disabledCfg, {
+      sessionId: "00000000-0000-0000-0000-000000000001",
+    });
+    expect(result.ok).toBe(true);
+    expect(result.itemsSent).toBe(0);
+  });
+
+  test("returns ok when transcript does not exist", async () => {
+    const result = await flushSessionToHindsight(disabledCfg, {
+      sessionId: "nonexistent-session-id",
+      contextLabel: "discord:#test",
+    });
+    expect(result.ok).toBe(true);
+    expect(result.itemsSent).toBe(0);
+  });
+
+  test("returns ok with minimal metadata", async () => {
+    const result = await flushSessionToHindsight(disabledCfg, {
+      sessionId: "00000000-0000-0000-0000-000000000002",
+    });
+    expect(result.ok).toBe(true);
   });
 });
