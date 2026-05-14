@@ -1,4 +1,4 @@
-import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, compactCurrentThreadSession, compactCurrentChannelSession, agentDirKey } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, compactCurrentThreadSession, compactCurrentChannelSession, agentDirKey, claudeSessionExists } from "../runner";
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
 import { getSettings, loadSettings, DEFAULT_IMAGE_OUTPUT_ROOT } from "../config";
@@ -132,6 +132,19 @@ let readyGuildIds: Set<string> | null = null;
 
 // Track known thread channel IDs and their parent channel IDs for multi-session support
 const knownThreads = new Map<string, { parentId: string; agentName?: string }>();
+
+// Track pending stale-attach recovery choices.
+// Keyed by channelId (Discord channel or thread snowflake).
+// When an attached session is stale, the user gets buttons; clicking one resolves the entry.
+interface StaleAttachContext {
+  /** The stale session ID that failed to resume. */
+  sessionId: string;
+  /** Whether the context is a thread (true) or channel (false). */
+  isThread: boolean;
+  /** Timestamp when the stale state was detected (for expiry). */
+  detectedAt: number;
+}
+const pendingStaleAttaches = new Map<string, StaleAttachContext>();
 
 function isDiscordThreadType(type: number | undefined): boolean {
   return type === 10 || type === 11 || type === 12;
@@ -1183,6 +1196,53 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
       }
     }
 
+    // Stale attached-session detection: if the session was created via /attach
+    // and the Claude session JSONL no longer exists, present a choice instead
+    // of silently creating a new session.
+    const attachedSession = sessionThreadId
+      ? (await peekThreadSession(sessionThreadId))
+      : sessionChannelId
+        ? (await peekChannelSession(sessionChannelId))
+        : null;
+    if (attachedSession?.attached && !claudeSessionExists(attachedSession.sessionId)) {
+      // Expire old pending entries (> 10 minutes)
+      const now = Date.now();
+      for (const [key, ctx] of pendingStaleAttaches) {
+        if (now - ctx.detectedAt > 10 * 60 * 1000) pendingStaleAttaches.delete(key);
+      }
+
+      pendingStaleAttaches.set(channelId, {
+        sessionId: attachedSession.sessionId,
+        isThread: !!sessionThreadId,
+        detectedAt: now,
+      });
+
+      const shortId = attachedSession.sessionId.slice(0, 8);
+      await sendMessage(config.token, channelId, {
+        content: `⚠️ Attached session \`${shortId}\` no longer exists. What would you like to do?`,
+        components: [
+          {
+            type: 1, // ACTION_ROW
+            components: [
+              {
+                type: 2, // BUTTON
+                style: 4, // DANGER
+                label: "Stop (clear binding)",
+                custom_id: `stale_stop_${channelId}`,
+              },
+              {
+                type: 2, // BUTTON
+                style: 3, // SUCCESS
+                label: "Create new session",
+                custom_id: `stale_new_${channelId}`,
+              },
+            ],
+          },
+        ],
+      } as any);
+      return;
+    }
+
     if (config.streaming) {
       streamCb = makeDiscordStreamCallback(config.token, channelId);
     }
@@ -1535,10 +1595,10 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
 
         const isThread = !!oldThreadSession;
         if (isThread) {
-          await createThreadSession(attachChannelId!, sessionId);
+          await createThreadSession(attachChannelId!, sessionId, { attached: true });
         } else {
           const channelName = config.channelNames?.[attachChannelId!] ?? "";
-          await createChannelSession(attachChannelId!, sessionId, channelName);
+          await createChannelSession(attachChannelId!, sessionId, channelName, true);
         }
         await respondToInteraction(interaction, {
           content: `✅ Attached to session \`${sessionId.slice(0, 8)}\` in this ${isThread ? "thread" : "channel"}.`,
@@ -1584,6 +1644,47 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
         content: responseText,
         flags: 64, // EPHEMERAL
       });
+      return;
+    }
+
+    // Stale attached-session recovery buttons: "stale_stop_<channelId>" or "stale_new_<channelId>"
+    const staleMatch = customId.match(/^stale_(stop|new)_(\d+)$/);
+    if (staleMatch) {
+      const action = staleMatch[1];
+      const channelId = staleMatch[2];
+      const ctx = pendingStaleAttaches.get(channelId);
+      if (!ctx) {
+        await respondToInteraction(interaction, {
+          content: "This choice has expired. Send another message to retry.",
+          flags: 64,
+        });
+        return;
+      }
+      pendingStaleAttaches.delete(channelId);
+
+      if (action === "stop") {
+        // Clear the attached binding
+        if (ctx.isThread) {
+          await removeThreadSession(channelId);
+        } else {
+          await removeChannelSession(channelId);
+        }
+        await resetFallbackSession(undefined, channelId);
+        await respondToInteraction(interaction, {
+          content: `✅ Cleared stale session binding \`${ctx.sessionId.slice(0, 8)}\`. This context is now inactive. Send a message to start fresh.`,
+        });
+      } else {
+        // Create new session: remove the stale attached flag and let the next message create a fresh session
+        if (ctx.isThread) {
+          await removeThreadSession(channelId);
+        } else {
+          await removeChannelSession(channelId);
+        }
+        await resetFallbackSession(undefined, channelId);
+        await respondToInteraction(interaction, {
+          content: `✅ Cleared stale session \`${ctx.sessionId.slice(0, 8)}\`. Send a message to create a fresh session for this context.`,
+        });
+      }
       return;
     }
 
