@@ -23,6 +23,11 @@ import {
   removeThreadSession,
   incrementThreadTurn,
   markThreadCompactWarned,
+  getChannelSession,
+  createChannelSession,
+  removeChannelSession,
+  incrementChannelTurn,
+  markChannelCompactWarned,
 } from "./sessionManager";
 import { getSettings, DEFAULT_SESSION_TIMEOUT_MS, type ModelConfig, type SecurityConfig } from "./config";
 import { buildClockPromptPrefix } from "./timezone";
@@ -138,11 +143,11 @@ function emitCompactEvent(event: CompactEvent): void {
   }
 }
 
-function pluginCtx(threadId?: string, agentName?: string): EventContext {
+function pluginCtx(threadId?: string, agentName?: string, channelId?: string): EventContext {
   return {
-    sessionKey: threadId || "global",
-    conversationId: threadId || "global",
-    channelId: threadId || "global",
+    sessionKey: threadId || channelId || "global",
+    conversationId: threadId || channelId || "global",
+    channelId: channelId || threadId || "global",
     agentId: agentName,
     workspaceDir: process.cwd(),
   };
@@ -249,6 +254,8 @@ export function markRateLimitNotified(): void {
 let globalQueue: Promise<unknown> = Promise.resolve();
 // Per-thread queues — each thread runs independently in parallel
 const threadQueues = new Map<string, Promise<unknown>>();
+// Per-channel queues — each channel runs independently in parallel
+const channelQueues = new Map<string, Promise<unknown>>();
 
 // Counter of concurrently-running main-queue sessions (per-thread queues run in parallel)
 let mainRunCount = 0;
@@ -265,7 +272,14 @@ function persistRunCount(): void {
   } catch {}
 }
 
-function enqueue<T>(fn: () => Promise<T>, threadId?: string): Promise<T> {
+function enqueue<T>(fn: () => Promise<T>, threadId?: string, channelId?: string): Promise<T> {
+  // Channel sessions get their own independent queue
+  if (channelId && !threadId) {
+    const current = channelQueues.get(channelId) ?? Promise.resolve();
+    const task = current.then(fn, fn);
+    channelQueues.set(channelId, task.then(() => {}, () => {}));
+    return task;
+  }
   if (threadId) {
     const current = threadQueues.get(threadId) ?? Promise.resolve();
     const task = current.then(fn, fn);
@@ -1019,6 +1033,35 @@ export async function compactCurrentThreadSession(
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
 
+// Compact a Discord channel session by channelId.
+export async function compactCurrentChannelSession(
+  channelId: string,
+  agentName?: string
+): Promise<{ success: boolean; message: string }> {
+  const existing = await getChannelSession(channelId);
+  if (!existing) return { success: false, message: "No active session to compact." };
+
+  const settings = getSettings();
+  const securityArgs = buildSecurityArgs(settings.security);
+  const baseEnv = cleanSpawnEnv();
+  const timeoutMs = settings.sessionTimeoutMs;
+
+  const compactCwd = agentName ? await ensureAgentDir(agentName) : undefined;
+  const ok = await runCompact(
+    existing.sessionId,
+    settings.model,
+    settings.api,
+    baseEnv,
+    securityArgs,
+    timeoutMs,
+    compactCwd
+  );
+
+  return ok
+    ? { success: true, message: `✅ Channel session compact complete (${existing.sessionId.slice(0, 8)})` }
+    : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
+}
+
 async function execClaude(
   name: string,
   prompt: string,
@@ -1028,16 +1071,17 @@ async function execClaude(
   agentName?: string,
   timeoutCategory?: string,
   onChunk?: (text: string) => void,
-  onToolEvent?: (line: string) => void
+  onToolEvent?: (line: string) => void,
+  channelId?: string,
 ): Promise<RunResult> {
   mainRunCount++;
   persistRunCount();
   try {
   await mkdir(LOGS_DIR, { recursive: true });
 
-  // Rotate the global session if thresholds are exceeded (thread/agent sessions are not rotated).
+  // Rotate the global session if thresholds are exceeded (thread/agent/channel sessions are not rotated).
   let rotationSummary: string | null = null;
-  if (!threadId && !agentName) {
+  if (!threadId && !agentName && !channelId) {
     const { session: sessionConfig } = getSettings();
     if (sessionConfig.autoRotate) {
       const peeked = await peekSession();
@@ -1049,7 +1093,9 @@ async function execClaude(
 
   const existing = threadId
     ? await getThreadSession(threadId)
-    : await getSession(agentName);
+    : channelId
+      ? await getChannelSession(channelId)
+      : await getSession(agentName);
   const isNew = !existing;
   // Start the watchdog clock for resumed sessions (we know the ID immediately).
   if (existing) startSession(existing.sessionId);
@@ -1092,7 +1138,7 @@ async function execClaude(
 
   // Plugins: before_agent_start — fired before Claude is invoked.
   const pm = getPluginManager();
-  const ctx = pluginCtx(threadId, agentName);
+  const ctx = pluginCtx(threadId, agentName, channelId);
   if (pm) await pm.emit("before_agent_start", { prompt }, ctx);
 
   // stream-json emits NDJSON events as Claude works, including during subagent (Task tool)
@@ -1194,12 +1240,14 @@ async function execClaude(
   if (exitCode !== 0 && !isNew && !usedFallback && SIGNATURE_ERROR.test(rawStdout + stderr)) {
     if (threadId) {
       await removeThreadSession(threadId);
+    } else if (channelId) {
+      await removeChannelSession(channelId);
     } else if (agentName) {
       await resetSession(agentName);
     } else {
       await backupSession();
     }
-    const label = threadId ? ` (thread ${threadId.slice(0, 8)})` : agentName ? ` (agent ${agentName})` : "";
+    const label = threadId ? ` (thread ${threadId.slice(0, 8)})` : channelId ? ` (channel ${channelId.slice(0, 8)})` : agentName ? ` (agent ${agentName})` : "";
     console.warn(
       `[${new Date().toLocaleTimeString()}] Detected corrupted session (thinking block signature mismatch). Reset${label}, retrying with fresh session...`
     );
@@ -1218,6 +1266,10 @@ async function execClaude(
       if (threadId) {
         await createThreadSession(threadId, sessionId);
         console.log(`[${new Date().toLocaleTimeString()}] Thread session recovered: ${sessionId} (thread ${threadId.slice(0, 8)})`);
+      } else if (channelId) {
+        const existingChannel = existing as { channelName?: string } | null;
+        await createChannelSession(channelId, sessionId, existingChannel?.channelName ?? "");
+        console.log(`[${new Date().toLocaleTimeString()}] Channel session recovered: ${sessionId} (channel ${channelId.slice(0, 8)})`);
       } else {
         await createSession(sessionId, agentName);
         const sLabel = agentName ? ` (agent ${agentName})` : "";
@@ -1248,6 +1300,8 @@ async function execClaude(
       await resetFallbackSession(agentName, threadId);
     } else if (threadId) {
       await removeThreadSession(threadId);
+    } else if (channelId) {
+      await removeChannelSession(channelId);
     } else if (agentName) {
       await resetSession(agentName);
     } else {
@@ -1304,6 +1358,10 @@ async function execClaude(
       if (threadId) {
         await createThreadSession(threadId, sessionId);
         console.log(`[${new Date().toLocaleTimeString()}] Thread session created: ${sessionId} (thread ${threadId.slice(0, 8)})`);
+      } else if (channelId) {
+        const existingChannel = existing as { channelName?: string } | null;
+        await createChannelSession(channelId, sessionId, existingChannel?.channelName ?? "");
+        console.log(`[${new Date().toLocaleTimeString()}] Channel session created: ${sessionId} (channel ${channelId.slice(0, 8)})`);
       } else {
         await createSession(sessionId, agentName);
         const label = agentName ? ` (agent ${agentName})` : "";
@@ -1341,8 +1399,8 @@ async function execClaude(
   ].join("\n");
 
   await Bun.write(logFile, output);
-  // Count this invocation for rotation tracking (global session only; agent sessions don't rotate).
-  if (!agentName && !threadId) await incrementMessageCount();
+  // Count this invocation for rotation tracking (global session only; agent/channel/thread sessions don't rotate).
+  if (!agentName && !threadId && !channelId) await incrementMessageCount();
   console.log(`[${new Date().toLocaleTimeString()}] Done: ${name} → ${logFile}`);
 
   // --- Watchdog: track consecutive timeouts ---
@@ -1397,7 +1455,7 @@ async function execClaude(
       });
 
       if (retryExec.exitCode === 0) {
-        const count = threadId ? await incrementThreadTurn(threadId) : await incrementTurn(agentName);
+        const count = threadId ? await incrementThreadTurn(threadId) : channelId ? await incrementChannelTurn(channelId) : await incrementTurn(agentName);
         console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${count} (after compact + retry)`);
       }
       return retryResult;
@@ -1406,13 +1464,15 @@ async function execClaude(
 
   // --- Turn tracking & compact warning ---
   if (exitCode === 0 && !isNew && !recoveredFromStale) {
-    const turnCount = threadId ? await incrementThreadTurn(threadId) : await incrementTurn(agentName);
-    const turnLabel = threadId ? ` (thread ${threadId.slice(0, 8)})` : agentName ? ` (agent ${agentName})` : "";
+    const turnCount = threadId ? await incrementThreadTurn(threadId) : channelId ? await incrementChannelTurn(channelId) : await incrementTurn(agentName);
+    const turnLabel = threadId ? ` (thread ${threadId.slice(0, 8)})` : channelId ? ` (channel ${channelId.slice(0, 8)})` : agentName ? ` (agent ${agentName})` : "";
     console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${turnCount}${turnLabel}`);
 
     if (turnCount >= COMPACT_WARN_THRESHOLD && existing && !existing.compactWarned) {
       if (threadId) {
         await markThreadCompactWarned(threadId);
+      } else if (channelId) {
+        await markChannelCompactWarned(channelId);
       } else {
         await markCompactWarned(agentName);
       }
@@ -1436,9 +1496,10 @@ export async function run(
   agentName?: string,
   timeoutCategory?: string,
   onChunk?: (text: string) => void,
-  onToolEvent?: (line: string) => void
+  onToolEvent?: (line: string) => void,
+  channelId?: string,
 ): Promise<RunResult> {
-  return enqueue(() => execClaude(name, prompt, threadId, modelOverride, timeoutMs, agentName, timeoutCategory, onChunk, onToolEvent), threadId);
+  return enqueue(() => execClaude(name, prompt, threadId, modelOverride, timeoutMs, agentName, timeoutCategory, onChunk, onToolEvent, channelId), threadId, channelId);
 }
 
 async function streamClaude(
@@ -1670,9 +1731,10 @@ export async function runUserMessage(
   agentName?: string,
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
-  modelOverride?: string
+  modelOverride?: string,
+  channelId?: string,
 ): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId, modelOverride, undefined, agentName, undefined, onChunk, onToolEvent);
+  return run(name, prefixUserMessageWithClock(prompt), threadId, modelOverride, undefined, agentName, undefined, onChunk, onToolEvent, channelId);
 }
 
 // Path where Claude Code stores session JSONL transcripts for this project
