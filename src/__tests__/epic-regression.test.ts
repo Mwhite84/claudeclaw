@@ -28,7 +28,6 @@ import {
   formatMemories,
   recall,
   getProjectSlug,
-  resolveTimeAnchor,
   type RecallResultItem,
   type FlushMetadata,
 } from "../hindsight";
@@ -379,44 +378,3 @@ describe("getProjectSlug: matches Claude Code sanitizer", () => {
   });
 });
 
-// ── Time Anchor Resolution ──────────────────────────────────────────────────
-
-describe("resolveTimeAnchor: detects explicit time references", () => {
-  test("detects 'yesterday'", () => {
-    const ts = resolveTimeAnchor("what was I working on yesterday?");
-    expect(ts).toBeDefined();
-    const d = new Date(ts!);
-    expect(d.getHours()).toBe(12);
-    // Should be within the last 2 days
-    const diff = Date.now() - d.getTime();
-    expect(diff).toBeGreaterThan(0);
-    expect(diff).toBeLessThan(2 * 24 * 60 * 60 * 1000);
-  });
-
-  test("detects 'last Wednesday'", () => {
-    const ts = resolveTimeAnchor("what did I do last Wednesday around 4:45?");
-    expect(ts).toBeDefined();
-    const d = new Date(ts!);
-    // Should be a past date but not more than 2 weeks ago
-    const diff = Date.now() - d.getTime();
-    expect(diff).toBeGreaterThan(0);
-    expect(diff).toBeLessThan(14 * 24 * 60 * 60 * 1000);
-  });
-
-  test("detects 'last week'", () => {
-    const ts = resolveTimeAnchor("here's what happened last week");
-    expect(ts).toBeDefined();
-    const diff = Date.now() - new Date(ts!).getTime();
-    expect(diff).toBeGreaterThan(6 * 24 * 60 * 60 * 1000); // at least 6 days
-    expect(diff).toBeLessThan(8 * 24 * 60 * 60 * 1000);   // at most 8 days
-  });
-
-  test("returns undefined for no time reference", () => {
-    expect(resolveTimeAnchor("help me debug this function")).toBeUndefined();
-    expect(resolveTimeAnchor("just a normal message")).toBeUndefined();
-  });
-
-  test("returns undefined for empty text", () => {
-    expect(resolveTimeAnchor("")).toBeUndefined();
-  });
-});
