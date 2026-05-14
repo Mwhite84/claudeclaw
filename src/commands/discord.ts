@@ -12,6 +12,7 @@ import { resolveSkillPrompt } from "../skills";
 import { mkdir } from "node:fs/promises";
 import { extname, join, basename, sep } from "node:path";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
+import { flushSessionToHindsight, type FlushMetadata } from "../hindsight";
 
 // --- Discord API constants ---
 
@@ -529,6 +530,100 @@ function isTextAttachment(a: DiscordAttachment): boolean {
   return ext === ".txt" || ext === ".md";
 }
 
+// ── Hindsight flush helper ─────────────────────────────────────────────────
+
+/** Attempt to flush a session to Hindsight. Logs errors, never throws. */
+async function attemptFlush(
+  sessionId: string,
+  opts: {
+    scopeId?: string;
+    channelName?: string;
+    contextLabel?: string;
+    createdAt?: string;
+  },
+): Promise<void> {
+  try {
+    const settings = getSettings();
+    const meta: FlushMetadata = {
+      sessionId,
+      surface: "discord",
+      scopeId: opts.scopeId,
+      channelName: opts.channelName,
+      contextLabel: opts.contextLabel ?? `discord:${opts.scopeId ?? "unknown"}`,
+      createdAt: opts.createdAt,
+    };
+    const result = await flushSessionToHindsight(settings.hindsight, meta);
+    if (!result.ok) {
+      console.warn(`[hindsight] Flush failed for session ${sessionId.slice(0, 8)}: ${result.error}`);
+    }
+  } catch (err) {
+    console.warn(`[hindsight] Flush error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Flush all Discord sessions to Hindsight sequentially, continuing past failures.
+ *  Returns a summary of results. */
+async function flushAllSessions(): Promise<{ flushed: number; failed: number }> {
+  const sessions = await listDiscordSessions();
+  let flushed = 0;
+  let failed = 0;
+
+  for (const cs of sessions.channels) {
+    const meta: FlushMetadata = {
+      sessionId: cs.sessionId,
+      surface: "discord",
+      scopeId: cs.channelId,
+      channelName: cs.channelName,
+      contextLabel: `discord:channel:${cs.channelName || cs.channelId}`,
+      createdAt: cs.createdAt,
+    };
+    const result = await flushSessionToHindsight(getSettings().hindsight, meta);
+    if (result.ok && result.itemsSent > 0) {
+      flushed++;
+    } else if (!result.ok) {
+      failed++;
+      console.warn(`[hindsight] Flush failed for channel session ${cs.sessionId.slice(0, 8)}: ${result.error}`);
+    }
+  }
+
+  for (const ts of sessions.threads) {
+    const meta: FlushMetadata = {
+      sessionId: ts.sessionId,
+      surface: "discord",
+      scopeId: ts.threadId,
+      channelName: ts.channelName,
+      contextLabel: `discord:thread:${ts.channelName || ts.threadId}`,
+      createdAt: ts.createdAt,
+    };
+    const result = await flushSessionToHindsight(getSettings().hindsight, meta);
+    if (result.ok && result.itemsSent > 0) {
+      flushed++;
+    } else if (!result.ok) {
+      failed++;
+      console.warn(`[hindsight] Flush failed for thread session ${ts.sessionId.slice(0, 8)}: ${result.error}`);
+    }
+  }
+
+  // Also flush global session if it exists
+  const globalSession = await peekSession();
+  if (globalSession) {
+    const meta: FlushMetadata = {
+      sessionId: globalSession.sessionId,
+      surface: "discord",
+      contextLabel: "discord:global",
+      createdAt: globalSession.createdAt,
+    };
+    const result = await flushSessionToHindsight(getSettings().hindsight, meta);
+    if (result.ok && result.itemsSent > 0) {
+      flushed++;
+    } else if (!result.ok) {
+      failed++;
+    }
+  }
+
+  return { flushed, failed };
+}
+
 async function downloadDiscordAttachment(
   attachment: DiscordAttachment,
   type: "image" | "voice",
@@ -564,6 +659,14 @@ async function registerSlashCommands(token: string): Promise<void> {
       name: "reset",
       description: "Reset the session for the current context",
       type: 1,
+      options: [
+        {
+          name: "all",
+          description: "Reset ALL sessions (channels, threads, and global)",
+          type: 5, // BOOLEAN
+          required: false,
+        },
+      ],
     },
     {
       name: "compact",
@@ -1153,14 +1256,49 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
     }
 
     if (interaction.data.name === "reset") {
+      const allOpt = interaction.data.options?.find((o) => o.name === "all");
       const isGuildCmd = !!interaction.guild_id && !!interaction.channel_id;
+
+      // Handle --all: flush all sessions sequentially, then clear
+      if (allOpt) {
+        await respondToInteraction(interaction, { content: "⏳ Flushing and resetting all sessions..." });
+        const flushResult = await flushAllSessions();
+        const clearResult = await clearAllSessions();
+        await resetSession();
+        await resetFallbackSession();
+        const summary = `✅ All sessions reset.\nFlushed: ${flushResult.flushed} | Flush failures: ${flushResult.failed} | Cleared: ${clearResult.threads + clearResult.channels} sessions`;
+        await fetch(
+          `${DISCORD_API}/webhooks/${applicationId}/${interaction.token}/messages/@original`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ content: summary }),
+          },
+        );
+        return;
+      }
+
       if (isGuildCmd) {
-        const isThread = !!(await peekThreadSession(interaction.channel_id!));
-        const isChannel = !isThread && !!(await peekChannelSession(interaction.channel_id!));
-        if (isThread) {
+        const threadSession = await peekThreadSession(interaction.channel_id!);
+        const channelSession = !threadSession ? await peekChannelSession(interaction.channel_id!) : null;
+        if (threadSession) {
+          // Flush to Hindsight before removing
+          await attemptFlush(threadSession.sessionId, {
+            scopeId: threadSession.threadId,
+            channelName: threadSession.channelName,
+            contextLabel: `discord:thread:${threadSession.channelName || threadSession.threadId}`,
+            createdAt: threadSession.createdAt,
+          });
           await removeThreadSession(interaction.channel_id!);
           await resetFallbackSession(undefined, interaction.channel_id!);
-        } else if (isChannel) {
+        } else if (channelSession) {
+          // Flush to Hindsight before removing
+          await attemptFlush(channelSession.sessionId, {
+            scopeId: channelSession.channelId,
+            channelName: channelSession.channelName,
+            contextLabel: `discord:channel:${channelSession.channelName || channelSession.channelId}`,
+            createdAt: channelSession.createdAt,
+          });
           await removeChannelSession(interaction.channel_id!);
           await resetFallbackSession(undefined, interaction.channel_id!);
         } else {
@@ -1168,6 +1306,13 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
           return;
         }
       } else {
+        const globalSession = await peekSession();
+        if (globalSession) {
+          await attemptFlush(globalSession.sessionId, {
+            contextLabel: "discord:global",
+            createdAt: globalSession.createdAt,
+          });
+        }
         await resetSession();
         await resetFallbackSession();
       }
@@ -1183,17 +1328,38 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
       const isGuildCmd = !!interaction.guild_id && !!compactChannelId;
       let result: { success: boolean; message: string };
       if (isGuildCmd) {
-        const isThread = !!(await peekThreadSession(compactChannelId!));
-        const isChannel = !isThread && !!(await peekChannelSession(compactChannelId!));
-        if (isThread) {
+        const threadSession = await peekThreadSession(compactChannelId!);
+        const channelSession = !threadSession ? await peekChannelSession(compactChannelId!) : null;
+        if (threadSession) {
+          // Flush to Hindsight before compacting
+          await attemptFlush(threadSession.sessionId, {
+            scopeId: threadSession.threadId,
+            channelName: threadSession.channelName,
+            contextLabel: `discord:thread:${threadSession.channelName || threadSession.threadId}`,
+            createdAt: threadSession.createdAt,
+          });
           result = await compactCurrentThreadSession(compactChannelId!, compactThreadInfo?.agentName);
-        } else if (isChannel) {
+        } else if (channelSession) {
+          // Flush to Hindsight before compacting
+          await attemptFlush(channelSession.sessionId, {
+            scopeId: channelSession.channelId,
+            channelName: channelSession.channelName,
+            contextLabel: `discord:channel:${channelSession.channelName || channelSession.channelId}`,
+            createdAt: channelSession.createdAt,
+          });
           result = await compactCurrentChannelSession(compactChannelId!);
         } else {
           await respondToInteraction(interaction, { content: "No active session to compact." });
           return;
         }
       } else {
+        const globalSession = await peekSession();
+        if (globalSession) {
+          await attemptFlush(globalSession.sessionId, {
+            contextLabel: "discord:global",
+            createdAt: globalSession.createdAt,
+          });
+        }
         result = await compactCurrentSession();
       }
       await respondToInteraction(interaction, { content: "⏳ Compacting session..." });
@@ -1348,7 +1514,26 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
         return;
       }
       if (isAttachGuild) {
-        const isThread = !!(await peekThreadSession(attachChannelId!));
+        // Flush old binding to Hindsight before replacing
+        const oldThreadSession = await peekThreadSession(attachChannelId!);
+        const oldChannelSession = !oldThreadSession ? await peekChannelSession(attachChannelId!) : null;
+        if (oldThreadSession) {
+          await attemptFlush(oldThreadSession.sessionId, {
+            scopeId: oldThreadSession.threadId,
+            channelName: oldThreadSession.channelName,
+            contextLabel: `discord:thread:${oldThreadSession.channelName || oldThreadSession.threadId}`,
+            createdAt: oldThreadSession.createdAt,
+          });
+        } else if (oldChannelSession) {
+          await attemptFlush(oldChannelSession.sessionId, {
+            scopeId: oldChannelSession.channelId,
+            channelName: oldChannelSession.channelName,
+            contextLabel: `discord:channel:${oldChannelSession.channelName || oldChannelSession.channelId}`,
+            createdAt: oldChannelSession.createdAt,
+          });
+        }
+
+        const isThread = !!oldThreadSession;
         if (isThread) {
           await createThreadSession(attachChannelId!, sessionId);
         } else {

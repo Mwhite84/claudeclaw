@@ -34,6 +34,7 @@ import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
 import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
 import { getPluginManager, type EventContext } from "./plugins";
+import { recall, isSubstantive } from "./hindsight";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 const ACTIVE_RUNS_FILE = join(process.cwd(), ".claude/claudeclaw/active-runs");
@@ -1174,6 +1175,30 @@ async function execClaude(
   if (pm) {
     const pluginResult = await pm.emit("before_prompt_build", { prompt }, ctx);
     if (pluginResult?.appendSystemContext) appendParts.push(pluginResult.appendSystemContext);
+  }
+
+  // Hindsight recall: on first substantive message of a new channel/thread session,
+  // query Hindsight and inject recalled memories into Claude's system prompt.
+  // Only for Discord channel/thread sessions (threadId or channelId present).
+  if (isNew && (threadId || channelId) && isSubstantive(prompt)) {
+    try {
+      const settings = getSettings();
+      const queryParts = [prompt.slice(0, 200)];
+      if (threadId || channelId) {
+        // Extract channel name from existing session metadata if available
+        const scopeLabel = channelId ? `channel:${channelId}` : `thread:${threadId}`;
+        queryParts.push(scopeLabel);
+      }
+      const recallResult = await recall(settings.hindsight, queryParts.join(" "));
+      if (recallResult.ok && recallResult.block) {
+        appendParts.push(recallResult.block);
+        console.log(`[hindsight] Recall injected for new ${(threadId ? "thread" : "channel")} session`);
+      } else if (!recallResult.ok) {
+        console.warn(`[hindsight] Recall failed: ${recallResult.error}`);
+      }
+    } catch (err) {
+      console.warn(`[hindsight] Recall error: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
