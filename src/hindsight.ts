@@ -18,6 +18,17 @@ import { homedir } from "node:os";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
+/**
+ * Sanitize a project directory path into Claude Code's transcript directory slug.
+ *
+ * Claude Code replaces slashes, backslashes, and dots with dashes when forming
+ * the `~/.claude/projects/<slug>/` directory name. All code that resolves
+ * transcript paths must use this helper so slugs stay consistent.
+ */
+export function getProjectSlug(projectDir?: string): string {
+  return (projectDir ?? process.cwd()).replace(/[/\\.]/g, "-");
+}
+
 /** Payload for a single memory item sent to the retain endpoint. */
 export interface RetainItem {
   /** Natural-language content to store. */
@@ -330,7 +341,7 @@ export interface FlushOutcome {
  */
 function sessionTranscriptPath(sessionId: string): string {
   const home = homedir();
-  const projectSlug = process.cwd().replace(/\//g, "-");
+  const projectSlug = getProjectSlug();
   return join(home, ".claude", "projects", projectSlug, `${sessionId}.jsonl`);
 }
 
@@ -454,4 +465,78 @@ export function isSubstantive(text: string): boolean {
   // Must have at least one word character or meaningful content
   // (voice transcripts will have words, text will have words)
   return /\w{2,}/u.test(trimmed) || trimmed.length >= 5;
+}
+
+// ── Time Anchor Resolution ──────────────────────────────────────────────────
+
+// Patterns that signal the user is referencing a specific time in the past.
+const TIME_ANCHOR_RE = /\b(yesterday|last\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|week|month))\b|\b(\d{1,2})\s*(?:am|pm)\b/i;
+
+const DAY_NAMES = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"] as const;
+
+/**
+ * Detect explicit time references in user text and resolve them to an ISO
+ * timestamp suitable for Hindsight's `query_timestamp` parameter.
+ *
+ * Returns `undefined` if no recognizable time anchor is found.
+ *
+ * This is intentionally lightweight — it handles the common cases like
+ * "yesterday", "last Wednesday", "last week", and time-of-day references.
+ * It does NOT attempt to parse full natural language dates.
+ */
+export function resolveTimeAnchor(text: string): string | undefined {
+  const match = text.match(TIME_ANCHOR_RE);
+  if (!match) return undefined;
+
+  const now = new Date();
+
+  // "yesterday"
+  if (match[1]?.toLowerCase() === "yesterday") {
+    const d = new Date(now);
+    d.setDate(d.getDate() - 1);
+    d.setHours(12, 0, 0, 0);
+    return d.toISOString();
+  }
+
+  // "last <dayname>"
+  const dayRef = match[1]?.toLowerCase();
+  const lastDayMatch = dayRef?.match(/^last\s+(\w+)$/);
+  if (lastDayMatch) {
+    const targetDay = DAY_NAMES.indexOf(lastDayMatch[1] as typeof DAY_NAMES[number]);
+    if (targetDay >= 0) {
+      const d = new Date(now);
+      const currentDay = d.getDay();
+      let diff = currentDay - targetDay;
+      if (diff <= 0) diff += 7;
+      d.setDate(d.getDate() - diff);
+      d.setHours(12, 0, 0, 0);
+      return d.toISOString();
+    }
+  }
+
+  // "last week" — 7 days ago
+  if (dayRef === "last week") {
+    const d = new Date(now);
+    d.setDate(d.getDate() - 7);
+    d.setHours(12, 0, 0, 0);
+    return d.toISOString();
+  }
+
+  // "last month" — 30 days ago
+  if (dayRef === "last month") {
+    const d = new Date(now);
+    d.setMonth(d.getMonth() - 1);
+    d.setHours(12, 0, 0, 0);
+    return d.toISOString();
+  }
+
+  // Time-of-day like "around 4pm" / "4:45pm" — resolve to today at that time
+  if (match[2]) {
+    const hour = parseInt(match[2], 10);
+    const d = new Date(now);
+    d.setHours(hour, 0, 0, 0);
+    return d.toISOString();
+  }
+
+  return undefined;
 }

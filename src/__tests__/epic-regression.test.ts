@@ -27,6 +27,8 @@ import {
   flushSessionToHindsight,
   formatMemories,
   recall,
+  getProjectSlug,
+  resolveTimeAnchor,
   type RecallResultItem,
   type FlushMetadata,
 } from "../hindsight";
@@ -354,5 +356,67 @@ describe("Hindsight failure paths", () => {
     ];
     const block = formatMemories(items, 5, 120);
     expect(block).toBe(""); // discarded, not partial
+  });
+});
+
+// ── Transcript Slug Generation ──────────────────────────────────────────────
+
+describe("getProjectSlug: matches Claude Code sanitizer", () => {
+  test("slashes become dashes", () => {
+    expect(getProjectSlug("/Users/atlas/ai")).toBe("-Users-atlas-ai");
+  });
+
+  test("dots are replaced, not preserved", () => {
+    expect(getProjectSlug("/Users/atlas/ai/atlas2.0/projects")).toBe("-Users-atlas-ai-atlas2-0-projects");
+  });
+
+  test("backslashes are replaced", () => {
+    expect(getProjectSlug("C:\\Users\\atlas\\repo")).toBe("C:-Users-atlas-repo");
+  });
+
+  test("mixed slashes, dots, and backslashes all become dashes", () => {
+    expect(getProjectSlug("/home/user.v2/test\\path")).toBe("-home-user-v2-test-path");
+  });
+});
+
+// ── Time Anchor Resolution ──────────────────────────────────────────────────
+
+describe("resolveTimeAnchor: detects explicit time references", () => {
+  test("detects 'yesterday'", () => {
+    const ts = resolveTimeAnchor("what was I working on yesterday?");
+    expect(ts).toBeDefined();
+    const d = new Date(ts!);
+    expect(d.getHours()).toBe(12);
+    // Should be within the last 2 days
+    const diff = Date.now() - d.getTime();
+    expect(diff).toBeGreaterThan(0);
+    expect(diff).toBeLessThan(2 * 24 * 60 * 60 * 1000);
+  });
+
+  test("detects 'last Wednesday'", () => {
+    const ts = resolveTimeAnchor("what did I do last Wednesday around 4:45?");
+    expect(ts).toBeDefined();
+    const d = new Date(ts!);
+    // Should be a past date but not more than 2 weeks ago
+    const diff = Date.now() - d.getTime();
+    expect(diff).toBeGreaterThan(0);
+    expect(diff).toBeLessThan(14 * 24 * 60 * 60 * 1000);
+  });
+
+  test("detects 'last week'", () => {
+    const ts = resolveTimeAnchor("here's what happened last week");
+    expect(ts).toBeDefined();
+    const diff = Date.now() - new Date(ts!).getTime();
+    expect(diff).toBeGreaterThan(6 * 24 * 60 * 60 * 1000); // at least 6 days
+    expect(diff).toBeLessThan(8 * 24 * 60 * 60 * 1000);   // at most 8 days
+  });
+
+  test("returns undefined for no time reference", () => {
+    expect(resolveTimeAnchor("help me debug this function")).toBeUndefined();
+    expect(resolveTimeAnchor("just a normal message")).toBeUndefined();
+  });
+
+  test("returns undefined for empty text", () => {
+    expect(resolveTimeAnchor("")).toBeUndefined();
   });
 });

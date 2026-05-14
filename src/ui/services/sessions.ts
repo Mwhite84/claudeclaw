@@ -3,6 +3,7 @@ import { join, basename } from "node:path";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { getAgentsDir } from "../../config";
+import { getProjectSlug } from "../../hindsight";
 
 export interface SessionInfo {
   id: string;
@@ -27,7 +28,7 @@ const DISCORD_SNOWFLAKE_RE = /^\d{17,19}$/;
 
 // Must match Claude Code's JSONL directory sanitizer (slashes, backslashes, dots → dashes).
 function getProjectDir(): string {
-  const sanitized = process.cwd().replace(/[/\\.]/g, "-");
+  const sanitized = getProjectSlug();
   return join(homedir(), ".claude", "projects", sanitized);
 }
 

@@ -174,8 +174,10 @@ describe("sessions — agent-scoped paths", () => {
 
     expect(sessionsSrc).toContain('join(HEARTBEAT_DIR, "fallback-sessions", `${encodeURIComponent(threadId)}.json`)');
     expect(sessionsSrc).toContain("getFallbackSession(\n  agentName?: string,\n  threadId?: string");
-    expect(runnerSrc).toContain("getFallbackSession(agentName, threadId)");
-    expect(runnerSrc).toContain("createFallbackSession(exec.sessionId, agentName, threadId)");
+    // Runner uses fallbackScopeId (threadId ?? channelId) to key fallback sessions
+    expect(runnerSrc).toContain("const fallbackScopeId = threadId ?? channelId");
+    expect(runnerSrc).toContain("getFallbackSession(agentName, fallbackScopeId)");
+    expect(runnerSrc).toContain("createFallbackSession(exec.sessionId, agentName, fallbackScopeId)");
     expect(discordSrc).toContain("resetFallbackSession(undefined, interaction.channel_id!)");
   });
 });
