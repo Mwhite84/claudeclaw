@@ -179,6 +179,29 @@ export async function resetFallbackSession(agentName?: string, threadId?: string
   }
 }
 
+/**
+ * Remove all scoped fallback session files (thread and channel keyed).
+ * Used by `/reset --all` to ensure no stale fallback transcripts remain.
+ */
+export async function resetAllScopedFallbackSessions(): Promise<number> {
+  const scopedDir = join(HEARTBEAT_DIR, "fallback-sessions");
+  let count = 0;
+  try {
+    const files = await readdir(scopedDir);
+    for (const file of files) {
+      try {
+        await unlink(join(scopedDir, file));
+        count++;
+      } catch {
+        // best-effort
+      }
+    }
+  } catch {
+    // directory doesn't exist yet, nothing to clear
+  }
+  return count;
+}
+
 export async function backupSession(): Promise<string | null> {
   const existing = await loadSession();
   if (!existing) return null;

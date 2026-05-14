@@ -34,7 +34,7 @@ import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
 import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
 import { getPluginManager, type EventContext } from "./plugins";
-import { recall, isSubstantive } from "./hindsight";
+import { recall, isSubstantive, getProjectSlug, resolveTimeAnchor } from "./hindsight";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 const ACTIVE_RUNS_FILE = join(process.cwd(), ".claude/claudeclaw/active-runs");
@@ -1189,7 +1189,11 @@ async function execClaude(
         const scopeLabel = channelId ? `channel:${channelId}` : `thread:${threadId}`;
         queryParts.push(scopeLabel);
       }
-      const recallResult = await recall(settings.hindsight, queryParts.join(" "));
+      // Detect explicit time references ("last Wednesday", "yesterday") for time-anchored recall
+      const timeAnchor = resolveTimeAnchor(prompt);
+      const recallResult = await recall(settings.hindsight, queryParts.join(" "), {
+        ...(timeAnchor ? { query_timestamp: timeAnchor } : {}),
+      });
       if (recallResult.ok && recallResult.block) {
         appendParts.push(recallResult.block);
         console.log(`[hindsight] Recall injected for new ${(threadId ? "thread" : "channel")} session`);
@@ -1200,6 +1204,9 @@ async function execClaude(
       console.warn(`[hindsight] Recall error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+
+  // Fallback sessions are scoped per thread OR per channel so they don't bleed context.
+  const fallbackScopeId = threadId ?? channelId;
 
   if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
   if (appendParts.length > 0) {
@@ -1217,7 +1224,7 @@ async function execClaude(
     console.warn(
       `[${new Date().toLocaleTimeString()}] Claude limit reached; retrying with fallback${fallbackConfig.model ? ` (${fallbackConfig.model})` : ""}...`
     );
-    const fallbackSession = await getFallbackSession(agentName, threadId);
+    const fallbackSession = await getFallbackSession(agentName, fallbackScopeId);
     const fallbackArgs = [CLAUDE_EXECUTABLE, "-p", prompt, "--output-format", "stream-json", "--verbose", ...securityArgs];
     if (fallbackSession) {
       fallbackArgs.push("--resume", fallbackSession.sessionId);
@@ -1231,8 +1238,8 @@ async function execClaude(
 
     // If the fallback resumed a corrupted session, reset it and retry fresh.
     if (!fallbackRateLimit && fallbackSession && exec.exitCode !== 0 && SIGNATURE_ERROR.test(exec.rawStdout + exec.stderr)) {
-      await resetFallbackSession(agentName, threadId);
-      const flabel = threadId ? ` (thread ${threadId.slice(0, 8)})` : agentName ? ` (agent ${agentName})` : "";
+      await resetFallbackSession(agentName, fallbackScopeId);
+      const flabel = fallbackScopeId ? ` (${threadId ? "thread" : "channel"} ${fallbackScopeId.slice(0, 8)})` : agentName ? ` (agent ${agentName})` : "";
       console.warn(
         `[${new Date().toLocaleTimeString()}] Detected corrupted fallback session (thinking block signature mismatch). Reset${flabel}, retrying fallback fresh...`
       );
@@ -1240,16 +1247,16 @@ async function execClaude(
       exec = await runClaudeStream(freshFallbackArgs, fallbackConfig.model, fallbackConfig.api, baseEnv, timeoutMs, spawnCwd);
       fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
       if (!fallbackRateLimit && exec.sessionId) {
-        await createFallbackSession(exec.sessionId, agentName, threadId);
+        await createFallbackSession(exec.sessionId, agentName, fallbackScopeId);
         console.log(`[${new Date().toLocaleTimeString()}] Fallback session recovered: ${exec.sessionId}${flabel}`);
       }
     } else if (!fallbackRateLimit) {
       if (!fallbackSession && exec.sessionId) {
-        await createFallbackSession(exec.sessionId, agentName, threadId);
-        const label = threadId ? ` (thread ${threadId.slice(0, 8)})` : agentName ? ` (agent ${agentName})` : "";
+        await createFallbackSession(exec.sessionId, agentName, fallbackScopeId);
+        const label = fallbackScopeId ? ` (${threadId ? "thread" : "channel"} ${fallbackScopeId.slice(0, 8)})` : agentName ? ` (agent ${agentName})` : "";
         console.log(`[${new Date().toLocaleTimeString()}] Fallback session created: ${exec.sessionId}${label}`);
       } else if (fallbackSession) {
-        await incrementFallbackTurn(agentName, threadId);
+        await incrementFallbackTurn(agentName, fallbackScopeId);
       }
     }
   }
@@ -1322,7 +1329,7 @@ async function execClaude(
     );
 
     if (usedFallback) {
-      await resetFallbackSession(agentName, threadId);
+      await resetFallbackSession(agentName, fallbackScopeId);
     } else if (threadId) {
       await removeThreadSession(threadId);
     } else if (channelId) {
@@ -1375,8 +1382,8 @@ async function execClaude(
   if (!rateLimitMessage && parseAsNew && exec.sessionId) {
     sessionId = exec.sessionId;
     if (recoveredFromStale && usedFallback) {
-      await createFallbackSession(sessionId, agentName, threadId);
-      const label = threadId ? ` (thread ${threadId.slice(0, 8)})` : agentName ? ` (agent ${agentName})` : "";
+      await createFallbackSession(sessionId, agentName, fallbackScopeId);
+      const label = fallbackScopeId ? ` (${threadId ? "thread" : "channel"} ${fallbackScopeId.slice(0, 8)})` : agentName ? ` (agent ${agentName})` : "";
       console.log(`[${new Date().toLocaleTimeString()}] Fallback session created: ${sessionId}${label}`);
       startSession(sessionId);
     } else if (!usedFallback) {
@@ -1767,7 +1774,7 @@ const CLAUDE_SESSIONS_DIR = join(
   process.env.HOME ?? "/root",
   ".claude",
   "projects",
-  PROJECT_DIR.replace(/\//g, "-")
+  getProjectSlug(PROJECT_DIR)
 );
 
 /** Check whether a Claude session has a local JSONL transcript file. */

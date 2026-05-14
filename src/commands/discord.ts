@@ -2,7 +2,7 @@ import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, comp
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
 import { getSettings, loadSettings, DEFAULT_IMAGE_OUTPUT_ROOT } from "../config";
-import { resetSession, resetFallbackSession, peekSession } from "../sessions";
+import { resetSession, resetFallbackSession, resetAllScopedFallbackSessions, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession, getChannelSession, createChannelSession, removeChannelSession, peekChannelSession, countChannelSessions, clearAllSessions, listDiscordSessions } from "../sessionManager";
 import { readFile } from "node:fs/promises";
 import { existsSync, realpathSync, statSync } from "node:fs";
@@ -1070,6 +1070,12 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
   const hasForwardedContent = !!message.message_snapshots?.[0]?.message?.content;
   if (!content.trim() && !hasImage && !hasVoice && !hasText && !hasForwardedContent) return;
 
+  // Strip bot mention from content for cleaner prompt (needed by memo channels and main path)
+  let cleanContent = content;
+  if (botUserId) {
+    cleanContent = cleanContent.replace(new RegExp(`<@!?${botUserId}>`, "g"), "").trim();
+  }
+
   // ── Memo channel handling ──────────────────────────────────────────────────
   // Memo channels bypass Claude routing and ingest directly to Hindsight.
   // They must not create or resume Claude conversation sessions.
@@ -1103,12 +1109,6 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
     clearTimeout(pending.timer);
     pendingForwards.delete(forwardKey);
     coalescedSnapshot = pending.snapshot;
-  }
-
-  // Strip bot mention from content for cleaner prompt
-  let cleanContent = content;
-  if (botUserId) {
-    cleanContent = cleanContent.replace(new RegExp(`<@!?${botUserId}>`, "g"), "").trim();
   }
 
   const label = message.author.username;
@@ -1345,7 +1345,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
       if (!existingChannel) {
         const count = await countChannelSessions();
         if (config.maxChannelSessions > 0 && count >= config.maxChannelSessions) {
-          await sendMessage(config.token, channelId, "⚠️ Maximum channel sessions reached. Use `/reset` in an existing channel to free a slot.");
+          await sendMessage(config.token, channelId, `⚠️ Session limit reached (${count}/${config.maxChannelSessions}). Close or clear an existing session before starting a new one.`);
           return;
         }
       }
@@ -1373,9 +1373,11 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
       });
 
       const shortId = attachedSession.sessionId.slice(0, 8);
-      await sendMessage(config.token, channelId, {
-        content: `⚠️ Attached session \`${shortId}\` no longer exists. What would you like to do?`,
-        components: [
+      await sendMessage(
+        config.token,
+        channelId,
+        `⚠️ Attached session \`${shortId}\` no longer exists. What would you like to do?`,
+        [
           {
             type: 1, // ACTION_ROW
             components: [
@@ -1394,7 +1396,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
             ],
           },
         ],
-      } as any);
+      );
       return;
     }
 
@@ -1481,7 +1483,8 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
         const clearResult = await clearAllSessions();
         await resetSession();
         await resetFallbackSession();
-        const summary = `✅ All sessions reset.\nFlushed: ${flushResult.flushed} | Flush failures: ${flushResult.failed} | Cleared: ${clearResult.threads + clearResult.channels} sessions`;
+        const fallbackCleared = await resetAllScopedFallbackSessions();
+        const summary = `✅ All sessions reset.\nFlushed: ${flushResult.flushed} | Flush failures: ${flushResult.failed} | Cleared: ${clearResult.threads + clearResult.channels} sessions | Fallbacks cleared: ${fallbackCleared}`;
         await fetch(
           `${DISCORD_API}/webhooks/${applicationId}/${interaction.token}/messages/@original`,
           {
@@ -1748,7 +1751,10 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
           });
         }
 
-        const isThread = !!oldThreadSession;
+        // Determine thread vs channel from Discord context, not from whether
+        // a prior mapping exists. A fresh thread has no oldThreadSession but
+        // is still a thread — attaching must create a thread session.
+        const isThread = knownThreads.has(attachChannelId!);
         if (isThread) {
           await createThreadSession(attachChannelId!, sessionId, { attached: true });
         } else {
