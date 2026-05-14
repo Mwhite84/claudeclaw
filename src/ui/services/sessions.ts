@@ -138,6 +138,25 @@ export async function listSessions(): Promise<SessionInfo[]> {
   try {
     if (existsSync(sessionsFile)) {
       const data = JSON.parse(await readFile(sessionsFile, "utf-8"));
+      // Channel sessions
+      for (const [channelId, channel] of Object.entries(data.channels ?? {})) {
+        const c = channel as any;
+        if (!UUID_RE.test(c.sessionId) || knownIds.has(c.sessionId)) continue;
+        if (!DISCORD_SNOWFLAKE_RE.test(channelId)) continue;
+        const { first, last } = await peekMessages(c.sessionId);
+        sessions.push({
+          id: c.sessionId,
+          agent: "global",
+          channel: "discord",
+          lastUsedAt: c.lastUsedAt || c.createdAt,
+          createdAt: c.createdAt,
+          turnCount: c.turnCount ?? 0,
+          firstMessage: first,
+          lastMessage: last,
+        });
+        knownIds.add(c.sessionId);
+      }
+      // Thread sessions
       for (const [threadId, thread] of Object.entries(data.threads ?? {})) {
         const t = thread as any;
         if (!UUID_RE.test(t.sessionId) || knownIds.has(t.sessionId)) continue;
