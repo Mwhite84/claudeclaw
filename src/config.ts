@@ -84,6 +84,7 @@ const DEFAULT_SETTINGS: Settings = {
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
+  hindsight: { baseUrl: "", token: "", bankId: "", recallMaxItems: 5, recallMaxChars: 4000, timeoutMs: 5000 },
   sessionTimeoutMs: DEFAULT_SESSION_TIMEOUT_MS,
   timeouts: { telegram: 5, heartbeat: 15, job: 30, default: 5 },
   watchdog: { maxConsecutiveTimeouts: null, maxRuntimeSeconds: null },
@@ -177,6 +178,7 @@ export interface Settings {
   security: SecurityConfig;
   web: WebConfig;
   stt: SttConfig;
+  hindsight: HindsightConfig;
   apiToken?: string;
   sessionTimeoutMs: number;
   timeouts: TimeoutsConfig;
@@ -222,6 +224,21 @@ export interface SttConfig {
    *  or "whisper"). When set, whisper is skipped and Claude is asked to call this tool directly
    *  with the audio file path. When unset (default), whisper handles transcription. */
   delegateTool?: string;
+}
+
+export interface HindsightConfig {
+  /** Base URL of the Hindsight API, e.g. "http://127.0.0.1:8000". Empty string disables Hindsight. */
+  baseUrl: string;
+  /** Optional bearer token for the Authorization header. */
+  token: string;
+  /** Memory bank ID to use for all retain/recall calls. */
+  bankId: string;
+  /** Maximum number of recall items to include in injected memory blocks. Default: 5. */
+  recallMaxItems: number;
+  /** Maximum character length of the injected `<hindsight_memories>` block. Default: 4000. */
+  recallMaxChars: number;
+  /** HTTP request timeout in milliseconds. Default: 5000. */
+  timeoutMs: number;
 }
 
 export interface SessionConfig {
@@ -392,6 +409,20 @@ function parseSettings(
       ...(typeof raw.stt?.delegateTool === "string" && raw.stt.delegateTool.trim()
         ? { delegateTool: raw.stt.delegateTool.trim() }
         : {}),
+    },
+    hindsight: {
+      baseUrl: typeof raw.hindsight?.baseUrl === "string" ? raw.hindsight.baseUrl.trim() : "",
+      token: typeof raw.hindsight?.token === "string" ? raw.hindsight.token.trim() : "",
+      bankId: typeof raw.hindsight?.bankId === "string" ? raw.hindsight.bankId.trim() : "",
+      recallMaxItems: Number.isFinite(raw.hindsight?.recallMaxItems) && Number(raw.hindsight.recallMaxItems) > 0
+        ? Number(raw.hindsight.recallMaxItems)
+        : 5,
+      recallMaxChars: Number.isFinite(raw.hindsight?.recallMaxChars) && Number(raw.hindsight.recallMaxChars) > 0
+        ? Number(raw.hindsight.recallMaxChars)
+        : 4000,
+      timeoutMs: Number.isFinite(raw.hindsight?.timeoutMs) && Number(raw.hindsight.timeoutMs) > 0
+        ? Number(raw.hindsight.timeoutMs)
+        : 5000,
     },
     sessionTimeoutMs: typeof raw.sessionTimeoutMs === "number" && raw.sessionTimeoutMs > 0
       ? raw.sessionTimeoutMs
