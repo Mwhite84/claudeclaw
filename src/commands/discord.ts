@@ -12,7 +12,7 @@ import { resolveSkillPrompt } from "../skills";
 import { mkdir } from "node:fs/promises";
 import { extname, join, basename, sep } from "node:path";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
-import { flushSessionToHindsight, type FlushMetadata } from "../hindsight";
+import { flushSessionToHindsight, retain, type FlushMetadata } from "../hindsight";
 
 // --- Discord API constants ---
 
@@ -857,6 +857,153 @@ function makeDiscordStreamCallback(token: string, channelId: string): DiscordStr
   return { onChunk, onToolEvent, finalize, waitForStreamMsg };
 }
 
+// --- Memo channel handler ────────────────────────────────────────────────────
+
+/**
+ * Handle a message in a memo channel: ingest to Hindsight instead of Claude.
+ *
+ * Payload rules:
+ * - text only → ingest raw text
+ * - voice only → ingest transcript
+ * - voice + text → ingest transcript plus user text together
+ * - plain text attachments appended as additional context
+ * - non-text, non-voice attachments ignored
+ * - multiple voice attachments → reject visibly
+ * - voice transcription retries up to 3 times
+ *
+ * On success: react ✅, no Claude reply.
+ * On failure: post visible error.
+ */
+async function handleMemoChannelMessage(
+  token: string,
+  message: DiscordMessage,
+  content: string,
+  voiceAttachments: DiscordAttachment[],
+  textAttachments: DiscordAttachment[],
+  cleanContent: string,
+): Promise<void> {
+  const config = getSettings().discord;
+  const channelId = message.channel_id;
+  const userId = message.author.id;
+
+  // Authorization: reject unauthorized users visibly
+  if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId)) {
+    await sendMessage(token, channelId, "❌ Unauthorized. You are not allowed to post memos.");
+    return;
+  }
+
+  // Reject multiple voice attachments
+  if (voiceAttachments.length > 1) {
+    await sendMessage(token, channelId, "❌ Multiple voice attachments are not supported. Please send one voice memo at a time.");
+    return;
+  }
+
+  // Determine text content from message + text attachments
+  const textParts: string[] = [];
+  if (cleanContent.trim()) textParts.push(cleanContent.trim());
+
+  // Fetch text attachment content
+  for (const ta of textAttachments) {
+    try {
+      const resp = await fetch(ta.url);
+      if (resp.ok) {
+        const raw = await resp.text();
+        const capped = raw.length > 51200 ? raw.slice(0, 51200) + "\n...[truncated]" : raw;
+        textParts.push(`[Attachment: ${ta.filename}]\n${capped}`);
+      }
+    } catch (err) {
+      console.warn(`[memo] Failed to fetch text attachment ${ta.filename}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  // Voice transcription with retry (up to 3 attempts)
+  let voiceTranscript: string | null = null;
+  if (voiceAttachments.length === 1) {
+    let voicePath: string | null = null;
+    try {
+      voicePath = await downloadDiscordAttachment(voiceAttachments[0], "voice");
+    } catch (err) {
+      console.error(`[memo] Failed to download voice: ${err instanceof Error ? err.message : err}`);
+      await sendMessage(token, channelId, "❌ Failed to download voice attachment.");
+      return;
+    }
+
+    if (voicePath) {
+      let lastError: string | null = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          voiceTranscript = await transcribeAudioToText(voicePath, {
+            debug: discordDebug,
+            log: (msg) => debugLog(msg),
+          });
+          if (voiceTranscript) break; // success
+        } catch (err) {
+          lastError = err instanceof Error ? err.message : String(err);
+          console.warn(`[memo] Transcription attempt ${attempt}/3 failed: ${lastError}`);
+        }
+      }
+
+      if (!voiceTranscript) {
+        const errMsg = lastError ?? "Unknown transcription error";
+        await sendMessage(token, channelId, `❌ Voice transcription failed after 3 attempts: ${errMsg}`);
+        return;
+      }
+    }
+  }
+
+  // Compose payload
+  const payloadParts: string[] = [];
+  if (voiceTranscript) {
+    payloadParts.push(`Voice transcript: ${voiceTranscript}`);
+  }
+  if (textParts.length > 0) {
+    payloadParts.push(textParts.join("\n\n"));
+  }
+
+  if (payloadParts.length === 0) {
+    // No usable content (e.g. only image attachments, which are ignored in memo channels)
+    await sendReaction(token, channelId, message.id, "✅");
+    return;
+  }
+
+  const payload = payloadParts.join("\n\n");
+
+  // Ingest to Hindsight
+  try {
+    const settings = getSettings();
+    const channelName = config.channelNames?.[channelId] ?? channelId;
+    const result = await retain(settings.hindsight, [
+      {
+        content: payload.slice(0, 100_000),
+        context: `discord:memo:${channelName}`,
+        timestamp: new Date().toISOString(),
+        metadata: {
+          channelId,
+          channelName,
+          author: message.author.username,
+          authorId: userId,
+          type: voiceTranscript ? (textParts.length > 0 ? "voice+text" : "voice") : "text",
+        },
+        tags: ["claudeclaw", "discord", "memo"],
+      },
+    ]);
+
+    if (!result.ok) {
+      console.warn(`[memo] Hindsight retain failed: ${result.error}`);
+      await sendMessage(token, channelId, `❌ Failed to ingest memo: ${result.error}`);
+      return;
+    }
+
+    // Success: react ✅, no Claude reply
+    await sendReaction(token, channelId, message.id, "✅");
+    console.log(`[memo] Ingested memo from ${message.author.username} in ${channelName} (${payload.length} chars)`);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[memo] Ingest error: ${errMsg}`);
+    await sendMessage(token, channelId, `❌ Memo ingest error: ${errMsg}`);
+  }
+}
+
 // --- Message handler ---
 
 // Pending forwards: when Discord delivers a forward with empty content, hold it briefly
@@ -922,6 +1069,14 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
 
   const hasForwardedContent = !!message.message_snapshots?.[0]?.message?.content;
   if (!content.trim() && !hasImage && !hasVoice && !hasText && !hasForwardedContent) return;
+
+  // ── Memo channel handling ──────────────────────────────────────────────────
+  // Memo channels bypass Claude routing and ingest directly to Hindsight.
+  // They must not create or resume Claude conversation sessions.
+  if (isGuild && config.memoChannels.includes(channelId)) {
+    await handleMemoChannelMessage(token, message, content, voiceAttachments, textAttachments, cleanContent);
+    return;
+  }
 
   const forwardKey = `${channelId}:${userId}`;
   const isForwardOnly = message.message_reference?.type === 1 && !content.trim() && !hasImage && !hasVoice && !hasText;
