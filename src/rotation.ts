@@ -3,6 +3,8 @@ import { join } from "path";
 import { existsSync } from "fs";
 import { peekSession, backupSession, resetSession } from "./sessions";
 import type { GlobalSession } from "./sessions";
+import { flushSessionToHindsight } from "./hindsight";
+import type { HindsightConfig } from "./config";
 
 const SUMMARY_TIMEOUT_MS = 60_000;
 import type { SessionConfig } from "./config";
@@ -36,7 +38,7 @@ export function needsRotation(session: GlobalSession, config: SessionConfig): bo
 }
 
 /** Rotate the global session. Returns the freshly-written summary content, or null if summary generation was skipped, timed out, or failed. */
-export async function rotateSession(config: SessionConfig): Promise<string | null> {
+export async function rotateSession(config: SessionConfig, hindsight?: HindsightConfig): Promise<string | null> {
   const session = await peekSession();
   if (!session) return null;
 
@@ -44,6 +46,18 @@ export async function rotateSession(config: SessionConfig): Promise<string | nul
   console.log(
     `[${new Date().toLocaleTimeString()}] Rotating session ${session.sessionId.slice(0, 8)} (messages: ${session.messageCount ?? 0}, age: ${ageH}h)`
   );
+
+  // Flush to Hindsight before rotating so the transcript is preserved
+  if (hindsight) {
+    const outcome = await flushSessionToHindsight(hindsight, {
+      sessionId: session.sessionId,
+      surface: "rotation",
+    }).catch((err) => {
+      console.error(`[${new Date().toLocaleTimeString()}] Hindsight flush failed on rotation:`, err);
+      return { ok: false, itemsSent: 0 };
+    });
+    console.log(`[${new Date().toLocaleTimeString()}] Hindsight flush on rotation: ${outcome.ok ? `ok (${outcome.itemsSent} items)` : "failed"}`);
+  }
 
   let freshSummary: string | null = null;
   if (config.summaryPath) {

@@ -1810,24 +1810,9 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
         return;
       }
       if (isAttachGuild) {
-        // Flush old binding to Hindsight before replacing
+        // Peek old sessions before replacing (local file reads, fast)
         const oldThreadSession = await peekThreadSession(attachChannelId!);
         const oldChannelSession = !oldThreadSession ? await peekChannelSession(attachChannelId!) : null;
-        if (oldThreadSession) {
-          await attemptFlush(oldThreadSession.sessionId, {
-            scopeId: oldThreadSession.threadId,
-            channelName: oldThreadSession.channelName,
-            contextLabel: `discord:thread:${oldThreadSession.channelName || oldThreadSession.threadId}`,
-            createdAt: oldThreadSession.createdAt,
-          });
-        } else if (oldChannelSession) {
-          await attemptFlush(oldChannelSession.sessionId, {
-            scopeId: oldChannelSession.channelId,
-            channelName: oldChannelSession.channelName,
-            contextLabel: `discord:channel:${oldChannelSession.channelName || oldChannelSession.channelId}`,
-            createdAt: oldChannelSession.createdAt,
-          });
-        }
 
         // Determine thread vs channel from Discord context, not from whether
         // a prior mapping exists. A fresh thread has no oldThreadSession but
@@ -1839,9 +1824,28 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
           const channelName = config.channelNames?.[attachChannelId!] ?? "";
           await createChannelSession(attachChannelId!, sessionId, channelName, true);
         }
+
+        // Respond to Discord FIRST — must happen within 3s or it times out
         await respondToInteraction(interaction, {
           content: `✅ Attached to session \`${sessionId.slice(0, 8)}\` in this ${isThread ? "thread" : "channel"}.`,
         });
+
+        // Flush old session to Hindsight in the background (after responding)
+        if (oldThreadSession) {
+          attemptFlush(oldThreadSession.sessionId, {
+            scopeId: oldThreadSession.threadId,
+            channelName: oldThreadSession.channelName,
+            contextLabel: `discord:thread:${oldThreadSession.channelName || oldThreadSession.threadId}`,
+            createdAt: oldThreadSession.createdAt,
+          });
+        } else if (oldChannelSession) {
+          attemptFlush(oldChannelSession.sessionId, {
+            scopeId: oldChannelSession.channelId,
+            channelName: oldChannelSession.channelName,
+            contextLabel: `discord:channel:${oldChannelSession.channelName || oldChannelSession.channelId}`,
+            createdAt: oldChannelSession.createdAt,
+          });
+        }
       } else {
         await respondToInteraction(interaction, {
           content: "❌ `/attach` is only supported in guild channels and threads.",

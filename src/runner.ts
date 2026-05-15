@@ -1083,11 +1083,11 @@ async function execClaude(
   // Rotate the global session if thresholds are exceeded (thread/agent/channel sessions are not rotated).
   let rotationSummary: string | null = null;
   if (!threadId && !agentName && !channelId) {
-    const { session: sessionConfig } = getSettings();
+    const { session: sessionConfig, hindsight: hindsightConfig } = getSettings();
     if (sessionConfig.autoRotate) {
       const peeked = await peekSession();
       if (peeked && needsRotation(peeked, sessionConfig)) {
-        rotationSummary = await rotateSession(sessionConfig);
+        rotationSummary = await rotateSession(sessionConfig, hindsightConfig);
       }
     }
   }
@@ -1541,11 +1541,11 @@ async function streamClaude(
 
   // Rotate the global session if thresholds are exceeded (mirrors the check in execClaude).
   let streamRotationSummary: string | null = null;
-  const { session: streamSessionConfig } = getSettings();
+  const { session: streamSessionConfig, hindsight: streamHindsightConfig } = getSettings();
   if (streamSessionConfig.autoRotate) {
     const streamPeeked = await peekSession();
     if (streamPeeked && needsRotation(streamPeeked, streamSessionConfig)) {
-      streamRotationSummary = await rotateSession(streamSessionConfig);
+      streamRotationSummary = await rotateSession(streamSessionConfig, streamHindsightConfig);
     }
   }
 

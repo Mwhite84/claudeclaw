@@ -43,6 +43,8 @@ export interface RetainItem {
   metadata?: Record<string, string>;
   /** Optional tags for visibility scoping during recall. */
   tags?: string[];
+  /** Retention strategy (e.g. "personal-note", "append"). */
+  strategy?: string;
 }
 
 /** A single result from the recall endpoint. */
@@ -63,6 +65,8 @@ export interface RecallResultItem {
 /** Return type for the retain helper. */
 export interface RetainOutcome {
   ok: boolean;
+  /** Operation ID returned by Hindsight for async retains. Use with pollOperationUntilComplete(). */
+  operationId?: string;
   /** Non-empty when ok is false. */
   error?: string;
 }
@@ -97,8 +101,9 @@ function headers(cfg: HindsightConfig): Record<string, string> {
 /**
  * Store one or more memory items via the Hindsight retain endpoint.
  *
- * Uses `async: true` so the call returns immediately after the server queues
- * the work — retain is non-blocking from ClaudeClaw's perspective.
+ * By default uses `async: true` so the call returns immediately after the
+ * server queues the work. Pass `{ sync: true }` to wait for confirmation
+ * that items were actually stored (used by memo channels).
  *
  * Returns `{ ok: true }` on success, `{ ok: false, error }` on any failure.
  * Callers are free to ignore errors; the conversation should continue regardless.
@@ -106,32 +111,82 @@ function headers(cfg: HindsightConfig): Record<string, string> {
 export async function retain(
   cfg: HindsightConfig,
   items: RetainItem[],
+  opts?: { sync?: boolean },
 ): Promise<RetainOutcome> {
   if (!isEnabled(cfg)) return { ok: true };
   if (items.length === 0) return { ok: true };
 
   const url = `${baseUrl(cfg)}/v1/default/banks/${encodeURIComponent(cfg.bankId)}/memories`;
+  const isSync = opts?.sync ?? false;
+  console.log(`[hindsight] retain → POST ${url} items=${items.length} sync=${isSync}`);
 
   try {
     const res = await fetch(url, {
       method: "POST",
       headers: headers(cfg),
-      body: JSON.stringify({ items, async: true }),
+      body: JSON.stringify({ items, async: !isSync }),
       signal: AbortSignal.timeout(cfg.timeoutMs),
     });
 
+    console.log(`[hindsight] retain ← HTTP ${res.status}`);
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       console.warn(`[hindsight] retain failed (${res.status}): ${body.slice(0, 200)}`);
       return { ok: false, error: `retain ${res.status}` };
     }
 
-    return { ok: true };
+    const json = await res.json().catch(() => null);
+    const operationId = json?.operation_id ?? undefined;
+    return { ok: true, operationId };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[hindsight] retain error: ${msg}`);
     return { ok: false, error: msg };
   }
+}
+
+/**
+ * Poll a Hindsight async operation until it completes, fails, or times out.
+ *
+ * Checks every `intervalMs` (default 5s) up to `maxWaitMs` (default 90s).
+ * Resolves true when the operation reaches "completed" status,
+ * false on failure/timeout/error.
+ */
+export async function pollOperationUntilComplete(
+  cfg: HindsightConfig,
+  operationId: string,
+  opts?: { intervalMs?: number; maxWaitMs?: number },
+): Promise<boolean> {
+  if (!isEnabled(cfg)) return false;
+  const intervalMs = opts?.intervalMs ?? 5000;
+  const maxWaitMs = opts?.maxWaitMs ?? 90_000;
+  const url = `${baseUrl(cfg)}/v1/default/banks/${encodeURIComponent(cfg.bankId)}/operations/${encodeURIComponent(operationId)}`;
+  const deadline = Date.now() + maxWaitMs;
+
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, intervalMs));
+    try {
+      const res = await fetch(url, {
+        headers: headers(cfg),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!res.ok) {
+        console.warn(`[hindsight] poll operation ${operationId.slice(0, 8)} HTTP ${res.status}`);
+        return false;
+      }
+      const json = await res.json();
+      const status: string = json?.status ?? "";
+      console.log(`[hindsight] poll operation ${operationId.slice(0, 8)} status=${status}`);
+      if (status === "completed") return true;
+      if (status === "failed" || status === "cancelled") return false;
+    } catch (err) {
+      console.warn(`[hindsight] poll operation error: ${err instanceof Error ? err.message : err}`);
+      return false;
+    }
+  }
+
+  console.warn(`[hindsight] poll operation ${operationId.slice(0, 8)} timed out after ${maxWaitMs}ms`);
+  return false;
 }
 
 /**
@@ -385,6 +440,55 @@ async function readTranscript(
     }
 
     return parts.length > 0 ? parts.join("\n\n") : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the last `maxTurns` message pairs from a session transcript.
+ *
+ * Used to inject recent conversation context into memo retain payloads when
+ * a voice memo arrives while a session is actively in progress.
+ * Returns null if the transcript doesn't exist or has no usable content.
+ */
+export async function readRecentTranscriptTail(
+  sessionId: string,
+  maxTurns = 8,
+): Promise<string | null> {
+  const jsonlPath = sessionTranscriptPath(sessionId);
+  if (!existsSync(jsonlPath)) return null;
+
+  try {
+    const raw = await readFile(jsonlPath, "utf8");
+    const lines = raw.trim().split("\n");
+    const parts: string[] = [];
+
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line);
+        if (obj.type === "assistant" && obj.message?.content) {
+          for (const block of obj.message.content) {
+            if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
+              parts.push(`[assistant]: ${block.text.trim()}`);
+            }
+          }
+        } else if (obj.type === "user" && obj.message?.content) {
+          for (const block of obj.message.content) {
+            if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
+              parts.push(`[user]: ${block.text.trim()}`);
+            }
+          }
+        }
+      } catch {
+        // skip malformed lines
+      }
+    }
+
+    if (parts.length === 0) return null;
+    // Take the last maxTurns * 2 parts (each turn = user + assistant pair)
+    const tail = parts.slice(-(maxTurns * 2));
+    return tail.join("\n\n");
   } catch {
     return null;
   }
