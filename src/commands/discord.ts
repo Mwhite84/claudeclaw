@@ -12,7 +12,8 @@ import { resolveSkillPrompt } from "../skills";
 import { mkdir } from "node:fs/promises";
 import { extname, join, basename, sep } from "node:path";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
-import { flushSessionToHindsight, retain, getProjectSlug, type FlushMetadata } from "../hindsight";
+import { flushSessionToHindsight, retain, pollOperationUntilComplete, readRecentTranscriptTail, getProjectSlug, type FlushMetadata } from "../hindsight";
+import { classifyMemo } from "../classify";
 
 // --- Discord API constants ---
 
@@ -965,13 +966,69 @@ async function handleMemoChannelMessage(
 
   const payload = payloadParts.join("\n\n");
 
+  // Inject recent conversation context if any session was active in the last 5 minutes.
+  // This lets Hindsight associate the memo with the active topic without requiring
+  // manual context — if there's nothing recent, the memo is stored as-is.
+  let recentContext: string | null = null;
+  try {
+    const FIVE_MINUTES_MS = 5 * 60 * 1000;
+    const now = Date.now();
+    const { channels, threads } = await listDiscordSessions();
+    const recentSessions = [
+      ...channels.filter(s => s.channelId !== channelId && now - new Date(s.lastUsedAt).getTime() < FIVE_MINUTES_MS),
+      ...threads.filter(s => s.parentChannelId !== channelId && now - new Date(s.lastUsedAt).getTime() < FIVE_MINUTES_MS),
+    ].sort((a, b) => new Date(b.lastUsedAt).getTime() - new Date(a.lastUsedAt).getTime());
+
+    if (recentSessions.length > 0) {
+      const contextParts: string[] = [];
+      for (const session of recentSessions.slice(0, 2)) {
+        const tail = await readRecentTranscriptTail(session.sessionId, 6);
+        if (tail) {
+          const label = ("channelName" in session && session.channelName)
+            ? session.channelName
+            : ("threadId" in session ? session.threadId : session.sessionId.slice(0, 8));
+          contextParts.push(`[from: ${label}]\n${tail}`);
+        }
+      }
+      if (contextParts.length > 0) {
+        recentContext = contextParts.join("\n\n---\n\n");
+        console.log(`[memo] Injecting recent context from ${contextParts.length} session(s)`);
+      }
+    }
+  } catch (err) {
+    console.warn(`[memo] Failed to collect recent context: ${err instanceof Error ? err.message : err}`);
+  }
+
+  // Classify the memo to determine actionability and extract keywords for indexing.
+  // Uses Sonnet for accurate classification. Non-blocking — falls back to "note" on error.
+  const settings = getSettings();
+  const apiKey = settings.api || process.env.ANTHROPIC_API_KEY || "";
+  const classification = await classifyMemo(payload, apiKey);
+  const memoTags = ["claudeclaw", "discord", "memo", ...classification.tags];
+  if (classification.type !== "note") memoTags.push(`memo:${classification.type}`);
+  console.log(`[memo] Classification: type=${classification.type} tags=[${classification.tags.join(",")}] keywords=[${classification.keywords.join(",")}]${classification.extractedDate ? ` date=${classification.extractedDate}` : ""}${classification.summary ? ` summary="${classification.summary}"` : ""}`);
+
+  // Build enriched content: raw transcript + classification metadata + optional recent context.
+  // Appending metadata gives Hindsight's semantic index more signal, especially for short memos.
+  const metaParts: string[] = [];
+  if (classification.summary) metaParts.push(`Summary: ${classification.summary}`);
+  if (classification.type !== "note") metaParts.push(`Type: ${classification.type}`);
+  if (classification.keywords.length > 0) metaParts.push(`Topics: ${classification.keywords.join(", ")}`);
+  if (classification.extractedDate) metaParts.push(`Date mentioned: ${classification.extractedDate}`);
+  const metaBlock = metaParts.length > 0 ? `\n\n--- Memo metadata ---\n${metaParts.join("\n")}` : "";
+
+  const fullContent = recentContext
+    ? `${payload}${metaBlock}\n\n--- Recent conversation context ---\n${recentContext}`
+    : `${payload}${metaBlock}`;
+
   // Ingest to Hindsight
   try {
-    const settings = getSettings();
     const channelName = config.channelNames?.[channelId] ?? channelId;
+    const memoType = voiceTranscript ? (textParts.length > 0 ? "voice+text" : "voice") : "text";
+    console.log(`[memo] Retaining to Hindsight — channel=${channelName} type=${memoType} chars=${fullContent.length} strategy=personal-note async=true${recentContext ? " (with context)" : ""}`);
     const result = await retain(settings.hindsight, [
       {
-        content: payload.slice(0, 100_000),
+        content: fullContent.slice(0, 100_000),
         context: `discord:memo:${channelName}`,
         timestamp: new Date().toISOString(),
         metadata: {
@@ -979,12 +1036,17 @@ async function handleMemoChannelMessage(
           channelName,
           author: message.author.username,
           authorId: userId,
-          type: voiceTranscript ? (textParts.length > 0 ? "voice+text" : "voice") : "text",
+          type: memoType,
+          ...(classification.type !== "note" ? { memoClass: classification.type } : {}),
+          ...(classification.extractedDate ? { extractedDate: classification.extractedDate } : {}),
+          ...(classification.summary ? { summary: classification.summary } : {}),
+          ...(classification.keywords.length > 0 ? { keywords: classification.keywords.join(", ") } : {}),
         },
-        tags: ["claudeclaw", "discord", "memo"],
+        tags: memoTags,
         strategy: "personal-note",
       },
-    ], { sync: true });
+    ]);
+    console.log(`[memo] Hindsight retain result: ok=${result.ok} operationId=${result.operationId ?? "none"}${result.error ? ` error=${result.error}` : ""}`);
 
     if (!result.ok) {
       console.warn(`[memo] Hindsight retain failed: ${result.error}`);
@@ -992,9 +1054,24 @@ async function handleMemoChannelMessage(
       return;
     }
 
-    // Success: react ✅, no Claude reply
+    // React ✅ immediately — memo is queued in Hindsight
     await sendReaction(token, channelId, message.id, "✅");
-    console.log(`[memo] Ingested memo from ${message.author.username} in ${channelName} (${payload.length} chars)`);
+    console.log(`[memo] Queued memo from ${message.author.username} in ${channelName} (${payload.length} chars)`);
+
+    // Poll for completion in the background; react 🧠 when Hindsight confirms storage
+    if (result.operationId) {
+      const opId = result.operationId;
+      const msgId = message.id;
+      (async () => {
+        const confirmed = await pollOperationUntilComplete(settings.hindsight, opId);
+        if (confirmed) {
+          console.log(`[memo] Hindsight confirmed storage for op ${opId.slice(0, 8)} — reacting 🧠`);
+          await sendReaction(token, channelId, msgId, "🧠").catch(() => {});
+        } else {
+          console.warn(`[memo] Hindsight did not confirm storage for op ${opId.slice(0, 8)}`);
+        }
+      })();
+    }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     console.error(`[memo] Ingest error: ${errMsg}`);
