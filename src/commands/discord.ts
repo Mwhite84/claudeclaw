@@ -1,9 +1,10 @@
 import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, compactCurrentThreadSession, compactCurrentChannelSession, agentDirKey, claudeSessionExists } from "../runner";
+import { readSessionTranscript, buildContextHandoff, writeHandoffFile } from "../session-reader";
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
 import { getSettings, loadSettings, DEFAULT_IMAGE_OUTPUT_ROOT } from "../config";
 import { resetSession, resetFallbackSession, resetAllScopedFallbackSessions, peekSession } from "../sessions";
-import { listThreadSessions, removeThreadSession, peekThreadSession, getChannelSession, createChannelSession, removeChannelSession, peekChannelSession, countChannelSessions, clearAllSessions, listDiscordSessions } from "../sessionManager";
+import { listThreadSessions, removeThreadSession, peekThreadSession, createThreadSession, getChannelSession, createChannelSession, removeChannelSession, peekChannelSession, countChannelSessions, clearAllSessions, listDiscordSessions } from "../sessionManager";
 import { readFile } from "node:fs/promises";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -133,6 +134,37 @@ let readyGuildIds: Set<string> | null = null;
 
 // Track known thread channel IDs and their parent channel IDs for multi-session support
 const knownThreads = new Map<string, { parentId: string; agentName?: string }>();
+
+// Deduplicate message IDs to prevent double-processing when Discord sends the same message
+// as both a parent-channel event and a thread event (happens with "Start Thread" panel).
+// Thread context wins over channel context — if a thread processes a message first,
+// subsequent channel events for the same ID are dropped. If channel goes first, the thread
+// version can still override it (thread wins).
+// TTL: 30 seconds — both events fire within milliseconds, so this window is plenty.
+type MessageCtx = "channel" | "thread";
+const processedMessageIds = new Map<string, { ts: number; ctx: MessageCtx }>();
+const MESSAGE_DEDUP_TTL_MS = 30_000;
+
+function checkDuplicateMessage(messageId: string, ctx: MessageCtx): boolean {
+  const now = Date.now();
+  // Evict stale entries
+  for (const [id, v] of processedMessageIds) {
+    if (now - v.ts > MESSAGE_DEDUP_TTL_MS) processedMessageIds.delete(id);
+  }
+  const existing = processedMessageIds.get(messageId);
+  if (!existing) {
+    processedMessageIds.set(messageId, { ts: now, ctx });
+    return false; // first time — process it
+  }
+  // Thread wins: if we already processed in thread context, skip channel duplicate
+  if (existing.ctx === "thread") return true;
+  // Channel was first, but thread now claims it — let thread win, skip it
+  if (existing.ctx === "channel" && ctx === "thread") {
+    processedMessageIds.set(messageId, { ts: now, ctx: "thread" });
+    return false; // allow thread to process
+  }
+  return true; // duplicate same-context
+}
 
 // Track pending stale-attach recovery choices.
 // Keyed by channelId (Discord channel or thread snowflake).
@@ -724,17 +756,29 @@ async function respondToInteraction(
   interaction: DiscordInteraction,
   data: { content: string; flags?: number; components?: unknown[] },
 ): Promise<void> {
-  await fetch(
-    `${DISCORD_API}/interactions/${interaction.id}/${interaction.token}/callback`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        type: 4, // CHANNEL_MESSAGE_WITH_SOURCE
-        data,
-      }),
-    },
-  );
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2500);
+  try {
+    const res = await fetch(
+      `${DISCORD_API}/interactions/${interaction.id}/${interaction.token}/callback`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: 4, // CHANNEL_MESSAGE_WITH_SOURCE
+          data,
+        }),
+        signal: controller.signal,
+      },
+    );
+    if (!res.ok) {
+      console.error(`[discord] respondToInteraction failed: ${res.status} ${res.statusText}`);
+    }
+  } catch (err) {
+    console.error("[discord] respondToInteraction error:", err);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // --- Discord streaming callback ---
@@ -1096,6 +1140,18 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
   const channelId = message.channel_id;
   const isDM = !message.guild_id;
   const isGuild = !!message.guild_id;
+
+  // Dedup: Discord sends the same message as both a parent-channel event and a thread event
+  // when using the "Start Thread" panel. Thread context wins over channel context.
+  // We determine context here (before knownThreads recovery) using the raw channel_id.
+  if (!skipCoalesce) {
+    const earlyIsThread = knownThreads.has(channelId);
+    const msgCtx: MessageCtx = earlyIsThread ? "thread" : "channel";
+    if (checkDuplicateMessage(message.id, msgCtx)) {
+      debugLog(`Skipping duplicate message ${message.id} (ctx=${msgCtx}) in channel ${channelId}`);
+      return;
+    }
+  }
   const content = message.content.replace(/\0/g, "");
 
   // Recover lost thread from sessions.json (fallback for knownThreads volatility)
@@ -1810,25 +1866,42 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
         return;
       }
       if (isAttachGuild) {
-        // Peek old sessions before replacing (local file reads, fast)
-        const oldThreadSession = await peekThreadSession(attachChannelId!);
-        const oldChannelSession = !oldThreadSession ? await peekChannelSession(attachChannelId!) : null;
-
-        // Determine thread vs channel from Discord context, not from whether
-        // a prior mapping exists. A fresh thread has no oldThreadSession but
-        // is still a thread — attaching must create a thread session.
+        // Determine thread vs channel from Discord context
         const isThread = knownThreads.has(attachChannelId!);
-        if (isThread) {
-          await createThreadSession(attachChannelId!, sessionId, { attached: true });
-        } else {
-          const channelName = config.channelNames?.[attachChannelId!] ?? "";
-          await createChannelSession(attachChannelId!, sessionId, channelName, true);
+
+        // Read the transcript before responding — it's fast (local file read)
+        const summary = readSessionTranscript(sessionId);
+
+        if (!summary) {
+          await respondToInteraction(interaction, {
+            content: `❌ Session \`${sessionId.slice(0, 8)}\` not found — can't find its JSONL file.`,
+          });
+          return;
         }
+
+        // Build context handoff and persist it keyed by the Discord channel/thread ID.
+        // The next message in this channel will be a brand-new CC session and will
+        // automatically pick up this file as its initial context.
+        const handoff = buildContextHandoff(summary);
+        writeHandoffFile(attachChannelId!, handoff);
 
         // Respond to Discord FIRST — must happen within 3s or it times out
         await respondToInteraction(interaction, {
-          content: `✅ Attached to session \`${sessionId.slice(0, 8)}\` in this ${isThread ? "thread" : "channel"}.`,
+          content: `✅ Found session \`${sessionId.slice(0, 8)}\` with ${summary.turnCount} turns. Starting new session with that context loaded.`,
         });
+
+        // Flush any existing session to Hindsight and clear it.
+        // We intentionally do NOT store the source sessionId into the session store —
+        // we want the next message to start a fresh CC session (not try to resume the
+        // source session, which may be from a different machine or project).
+        const oldThreadSession = await peekThreadSession(attachChannelId!);
+        const oldChannelSession = !oldThreadSession ? await peekChannelSession(attachChannelId!) : null;
+
+        if (isThread) {
+          await removeThreadSession(attachChannelId!);
+        } else {
+          await removeChannelSession(attachChannelId!);
+        }
 
         // Flush old session to Hindsight in the background (after responding)
         if (oldThreadSession) {
@@ -2103,6 +2176,7 @@ function handleDispatch(token: string, eventName: string, data: any): void {
       break;
 
     case "INTERACTION_CREATE":
+      console.log(`[Discord][GW] INTERACTION_CREATE type=${data.type} name=${data.data?.name} user=${data.member?.user?.username ?? data.user?.username ?? "unknown"}`);
       handleInteractionCreate(token, data).catch((err) =>
         console.error(`[Discord] INTERACTION_CREATE unhandled: ${err}`),
       );
