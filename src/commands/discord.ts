@@ -500,12 +500,15 @@ function guildTriggerReason(message: DiscordMessage): string | null {
   const config = getSettings().discord;
   if (config.listenChannels.includes(message.channel_id)) return "listen_channel";
 
+  // Thread-only channel: trigger for hire/fire in parent, normal responses in threads
+  if (config.threadOnlyChannels.includes(message.channel_id)) return "thread_only_channel";
+
   // Listen guild (respond to all messages in any channel/thread of this guild)
   if (message.guild_id && config.listenGuilds.includes(message.guild_id)) return "listen_guild";
 
-  // Thread whose parent channel is a listen channel
+  // Thread whose parent channel is a listen channel or thread-only channel
   const threadInfo = knownThreads.get(message.channel_id);
-  if (threadInfo && config.listenChannels.includes(threadInfo.parentId)) return "listen_channel_thread";
+  if (threadInfo && (config.listenChannels.includes(threadInfo.parentId) || config.threadOnlyChannels.includes(threadInfo.parentId))) return "listen_channel_thread";
 
   return null;
 }
@@ -1177,6 +1180,19 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
     console.log(`[Discord][DIAG] SKIP channel=${channelId} guild=${message.guild_id} inKnown=${knownThreads.has(channelId)} threadInfo=${JSON.stringify(threadInfo)} knownSize=${knownThreads.size} listenCh=${JSON.stringify(config.listenChannels)} text="${content.slice(0, 40)}"`);
     return;
   }
+
+  // Thread-only channels: in the parent channel, only process hire/fire thread management.
+  // Messages inside threads spawned from these channels proceed normally.
+  const threadInfo0 = knownThreads.get(channelId);
+  if (isGuild && !threadInfo0 && config.threadOnlyChannels.includes(channelId)) {
+    const intent = classifyThreadIntent(content);
+    if (!intent) {
+      debugLog(`Thread-only channel ${channelId}: ignoring non-thread-management message`);
+      return;
+    }
+    // Fall through — hire/fire intent will be handled below
+  }
+
   debugLog(
     `Handle message channel=${channelId} from=${userId} reason=${triggerReason} text="${content.slice(0, 80)}"`,
   );
@@ -2212,7 +2228,8 @@ function handleDispatch(token: string, eventName: string, data: any): void {
       if (data.id && data.parent_id) {
         upsertThread(data.id, data.parent_id, data.name);
         debugLog(`Thread tracked: ${data.id} (parent: ${data.parent_id} name: ${data.name ?? "unknown"})`);
-        if (getSettings().discord.listenChannels.includes(data.parent_id)) {
+        const discordCfg = getSettings().discord;
+        if (discordCfg.listenChannels.includes(data.parent_id) || discordCfg.threadOnlyChannels.includes(data.parent_id)) {
           discordApi(token, "PUT", `/channels/${data.id}/thread-members/@me`).catch((err) =>
             console.error(`[Discord] Failed to join thread ${data.id}: ${err}`),
           );
@@ -2412,6 +2429,9 @@ export function startGateway(debug = false): void {
   }
   if (config.listenGuilds.length > 0) {
     console.log(`  Listen guilds: ${config.listenGuilds.join(", ")}`);
+  }
+  if (config.threadOnlyChannels.length > 0) {
+    console.log(`  Thread-only channels: ${config.threadOnlyChannels.join(", ")}`);
   }
   if (discordDebug) console.log("  Debug: enabled");
 
