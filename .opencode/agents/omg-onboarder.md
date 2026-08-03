@@ -1,0 +1,1 @@
+/Users/atlas/ai/atlas2.0/projects/omg-cc/opencode/agents/omg-onboarder.md
