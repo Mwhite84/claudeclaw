@@ -14,6 +14,7 @@ import { getOrCreateWebToken } from "../ui/auth";
 import type { Job } from "../jobs";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
 import { PluginManager, setPluginManager } from "../plugins";
+import type { RunResult } from "../runner";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
@@ -122,6 +123,43 @@ try {
 `;
 
 const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
+
+export interface JobRetryState {
+  failCount: number;
+  retryAt: number;
+  rateLimited?: boolean;
+}
+
+export function getNextJobRetryState(
+  job: Pick<Job, "retry" | "retryDelay">,
+  result: Pick<RunResult, "exitCode">,
+  existing: JobRetryState | undefined,
+  nowMs: number,
+  rateLimited: boolean,
+  rateLimitResetAt: number,
+): JobRetryState | null {
+  if (result.exitCode === 0) return null;
+
+  if (rateLimited && rateLimitResetAt > nowMs) {
+    return {
+      failCount: existing?.failCount ?? 0,
+      retryAt: rateLimitResetAt,
+      rateLimited: true,
+    };
+  }
+
+  if (job.retry && job.retry > 0) {
+    const state = existing ?? { failCount: 0, retryAt: 0 };
+    state.failCount += 1;
+    if (state.failCount <= job.retry) {
+      state.retryAt = nowMs + (job.retryDelay ?? 300) * 1000;
+      delete state.rateLimited;
+      return state;
+    }
+  }
+
+  return null;
+}
 
 function parseClockMinutes(value: string): number | null {
   const match = value.match(/^([01]\d|2[0-3]):([0-5]\d)$/);
@@ -853,7 +891,7 @@ export async function start(args: string[] = []) {
   }
 
   // In-memory retry state: resets on daemon restart (no stale debt across restarts).
-  const jobRetryState = new Map<string, { failCount: number; retryAt: number }>();
+  const jobRetryState = new Map<string, JobRetryState>();
 
   // Track each job's most recent outcome so state.json can expose lastResult/lastRanAt
   // for crash-recovery + status displays. Resets on daemon restart (in-memory only).
@@ -881,24 +919,36 @@ export async function start(args: string[] = []) {
           .then(async (r) => {
             const restored = await restoreFrontmatter();
             if (restored) console.log(`[${ts()}] Restored frontmatter for job: ${job.name}`);
+            const nowMs = Date.now();
+            const rateLimited = isRateLimited();
+            const rateLimitResetAt = getRateLimitResetAt();
             jobLastResult.set(job.name, {
               result: r.exitCode === 0 ? "ok" : "error",
-              ranAt: Date.now(),
+              ranAt: nowMs,
             });
             if (r.exitCode === 0) {
               jobRetryState.delete(job.name);
-            } else if (job.retry && job.retry > 0) {
-              // Preserve existing state so failCount accumulates correctly across retries.
-              const state = jobRetryState.get(job.name) ?? { failCount: 0, retryAt: 0 };
-              state.failCount += 1;
-              if (state.failCount <= job.retry) {
-                const delayMs = (job.retryDelay ?? 300) * 1000;
-                state.retryAt = Date.now() + delayMs;
-                jobRetryState.set(job.name, state);
-                console.log(`[${ts()}] Job ${job.name} failed (attempt ${state.failCount}/${job.retry}), retrying in ${job.retryDelay ?? 300}s`);
+            } else {
+              const nextRetryState = getNextJobRetryState(
+                job,
+                r,
+                jobRetryState.get(job.name),
+                nowMs,
+                rateLimited,
+                rateLimitResetAt,
+              );
+              if (nextRetryState) {
+                jobRetryState.set(job.name, nextRetryState);
+                if (nextRetryState.rateLimited) {
+                  console.log(`[${ts()}] Job ${job.name} paused by Claude rate limit until ${new Date(nextRetryState.retryAt).toISOString()}`);
+                } else {
+                  console.log(`[${ts()}] Job ${job.name} failed (attempt ${nextRetryState.failCount}/${job.retry}), retrying in ${job.retryDelay ?? 300}s`);
+                }
               } else {
                 jobRetryState.delete(job.name);
-                console.log(`[${ts()}] Job ${job.name} exhausted ${job.retry} retries`);
+                if (job.retry && job.retry > 0) {
+                  console.log(`[${ts()}] Job ${job.name} exhausted ${job.retry} retries`);
+                }
               }
             }
             if (job.notify === false) return;
@@ -930,7 +980,11 @@ export async function start(args: string[] = []) {
           // Push retryAt to sentinel so subsequent cron ticks don't re-fire while in flight.
           // runJob's .then() handler overwrites this with the real next-retry time (or deletes it).
           retryState.retryAt = Number.MAX_SAFE_INTEGER;
-          console.log(`[${ts()}] Retrying job: ${job.name} (attempt ${retryState.failCount + 1}/${job.retry})`);
+          if (retryState.rateLimited) {
+            console.log(`[${ts()}] Resuming job after rate limit: ${job.name}`);
+          } else {
+            console.log(`[${ts()}] Retrying job: ${job.name} (attempt ${retryState.failCount + 1}/${job.retry})`);
+          }
           runJob(job);
           continue;
         }
