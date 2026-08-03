@@ -154,6 +154,78 @@ async function tryReadFile(path: string): Promise<string | null> {
   }
 }
 
+/**
+ * Resolve a skill by name to its markdown content for channel auto-loading.
+ * Search order (first match wins):
+ *   1. ~/.claude/skills/{name}/SKILL.md (and skill.md)
+ *   2. ~/.claude/skills/{name}.md
+ *   3. {cwd}/skills/{name}/SKILL.md (and skill.md)
+ *   4. {cwd}/skills/{name}.md
+ * Returns null if no file is found.
+ */
+export async function loadSkillContent(name: string): Promise<string | null> {
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+
+  const home = homedir();
+  const cwd = process.cwd();
+
+  const candidates = [
+    join(home, ".claude", "skills", trimmed, "SKILL.md"),
+    join(home, ".claude", "skills", trimmed, "skill.md"),
+    join(home, ".claude", "skills", `${trimmed}.md`),
+    join(cwd, "skills", trimmed, "SKILL.md"),
+    join(cwd, "skills", trimmed, "skill.md"),
+    join(cwd, "skills", `${trimmed}.md`),
+  ];
+
+  for (const path of candidates) {
+    const content = await tryReadFile(path);
+    if (content) return content;
+  }
+  return null;
+}
+
+/**
+ * Build the `<available_skills>` block for a channel's bound skills.
+ * Loads each skill via `loadSkillContent` and wraps in delimited XML-style tags.
+ * Missing skills are logged as warnings and skipped. Returns null if no skills
+ * resolved (no block injected).
+ *
+ * @param skillNames Array of skill name strings (from channelSkills config).
+ * @param channelId Channel ID for warning context (informational only).
+ */
+export async function buildChannelSkillsBlock(
+  skillNames: string[],
+  channelId: string,
+): Promise<string | null> {
+  if (!Array.isArray(skillNames) || skillNames.length === 0) return null;
+
+  const sections: string[] = [];
+  const loaded: string[] = [];
+  const missing: string[] = [];
+
+  for (const name of skillNames) {
+    const content = await loadSkillContent(name);
+    if (!content) {
+      missing.push(name);
+      console.warn(`[warn] skill '${name}' not found for channel ${channelId}`);
+      continue;
+    }
+    sections.push(`<skill name="${name}">\n${content}\n</skill>`);
+    loaded.push(name);
+  }
+
+  if (sections.length === 0) return null;
+
+  console.log(
+    `[skills] Channel ${channelId.slice(0, 8)}: injected ${loaded.length} skill(s) [${loaded.join(", ")}]` +
+      (missing.length > 0 ? `, missing [${missing.join(", ")}]` : ""),
+  );
+
+  return `<available_skills>\n${sections.join("\n")}\n</available_skills>`;
+}
+
 async function searchPluginSkills(
   pluginsDir: string,
   skillName: string,

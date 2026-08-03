@@ -28,7 +28,9 @@ import {
   removeChannelSession,
   incrementChannelTurn,
   markChannelCompactWarned,
+  peekThreadSession,
 } from "./sessionManager";
+import { buildChannelSkillsBlock } from "./skills";
 import { getSettings, DEFAULT_SESSION_TIMEOUT_MS, type ModelConfig, type SecurityConfig } from "./config";
 import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
@@ -1178,6 +1180,40 @@ async function execClaude(
     if (claudeMd.trim()) appendParts.push(claudeMd.trim());
   } catch (e) {
     console.error(`[${new Date().toLocaleTimeString()}] Failed to read project CLAUDE.md:`, e);
+  }
+
+  // FR-24: per-channel skill auto-loading. When a channel/thread session is invoked
+  // and discord.channelSkills binds skills to that channel, load each skill's
+  // markdown and inject as a delimited <available_skills> block. Threads inherit
+  // their parent channel's binding (resolved via peekThreadSession.parentChannelId).
+  // --append-system-prompt does not persist across --resume, so this runs every turn.
+  const channelSkillsMap = settings.discord?.channelSkills;
+  if (channelSkillsMap && (threadId || channelId)) {
+    let skillChannelId: string | undefined;
+    if (channelId) {
+      skillChannelId = channelId;
+    } else if (threadId) {
+      // Resolve parent channel for thread inheritance.
+      try {
+        const ts = await peekThreadSession(threadId);
+        skillChannelId = ts?.parentChannelId;
+      } catch {
+        // peek failure -> skip skill injection for this thread
+      }
+    }
+    if (skillChannelId) {
+      const boundSkills = channelSkillsMap[skillChannelId];
+      if (Array.isArray(boundSkills) && boundSkills.length > 0) {
+        try {
+          const block = await buildChannelSkillsBlock(boundSkills, skillChannelId);
+          if (block) appendParts.push(block);
+        } catch (err) {
+          console.warn(
+            `[skills] Channel skill injection failed for ${skillChannelId}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    }
   }
 
   // Plugins: before_prompt_build — lets plugins inject system context

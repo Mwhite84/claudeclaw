@@ -146,6 +146,11 @@ export interface DiscordConfig {
    *  Messages in the parent are only processed for hire/fire thread management intents.
    *  Threads spawned from these channels work normally. */
   threadOnlyChannels: string[];
+  /** Per-channel skill bindings. When a channel/thread session is invoked, the listed
+   *  skills are loaded and their content injected into Claude's system prompt.
+   *  Threads inherit their parent channel's bindings.
+   *  Map: channelId (Discord snowflake string) -> array of skill names. */
+  channelSkills?: Record<string, string[]>;
 }
 
 export interface SlackConfig {
@@ -418,6 +423,20 @@ function parseSettings(
       threadOnlyChannels: Array.isArray(raw.discord?.threadOnlyChannels)
         ? raw.discord.threadOnlyChannels.map(String)
         : [],
+      ...(raw.discord?.channelSkills && typeof raw.discord.channelSkills === "object" && !Array.isArray(raw.discord.channelSkills)
+        ? {
+            channelSkills: Object.fromEntries(
+              Object.entries(raw.discord.channelSkills as Record<string, unknown>)
+                .map(([k, v]) => [
+                  String(k),
+                  Array.isArray(v)
+                    ? v.filter((s: unknown) => typeof s === "string" && s.trim().length > 0).map((s: string) => s.trim())
+                    : [],
+                ])
+                .filter(([, skills]) => (skills as string[]).length > 0),
+            ),
+          }
+        : {}),
     },
     slack: {
       botToken: process.env.SLACK_BOT_TOKEN?.trim() || (typeof raw.slack?.botToken === "string" ? raw.slack.botToken.trim() : ""),
