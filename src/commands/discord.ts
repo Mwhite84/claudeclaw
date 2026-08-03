@@ -1279,6 +1279,12 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
     return;
   }
 
+  // Fire-and-forget ack: confirm receipt immediately so the user knows we got the
+  // message, even if Claude takes a while. Streaming output (if enabled) follows.
+  await sendMessage(config.token, channelId, "⚡").catch((err) => {
+    console.error(`[Discord] Failed to send ack: ${err instanceof Error ? err.message : err}`);
+  });
+
   // Typing indicator loop (Discord typing lasts 10s, fire every 8s)
   const typingInterval = setInterval(() => sendTyping(config.token, channelId), 8000);
   let streamCb: DiscordStreamCallbacks | undefined;
@@ -1567,6 +1573,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
           streamCb?.onToolEvent,
           undefined, // modelOverride
           sessionChannelId,
+          0x7fffffff, // fire-and-forget: setTimeout max (~24.8 days), effectively no timeout
         );
       } finally {
         if (streamCb) {

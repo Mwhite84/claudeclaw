@@ -124,6 +124,12 @@ function cleanSpawnEnv(): Record<string, string> {
     if (stripped.has(key)) continue;
     if (typeof value === "string") out[key] = value;
   }
+  // Suppress Hindsight's SessionEnd forced retain on every spawn. Each ClaudeClaw
+  // invocation is a one-shot `claude -p ... --resume <id>` that exits after
+  // responding, firing SessionEnd → force=True retain on every Discord/Telegram
+  // message. The Stop hook still runs the every-N-turns retain, so we lose
+  // nothing by disabling the forced one.
+  out.HINDSIGHT_DISABLE_STOP_RETAIN = "1";
   return out;
 }
 
@@ -1817,8 +1823,9 @@ export async function runUserMessage(
   onToolEvent?: (line: string) => void,
   modelOverride?: string,
   channelId?: string,
+  timeoutMsOverride?: number,
 ): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId, modelOverride, undefined, agentName, undefined, onChunk, onToolEvent, channelId);
+  return run(name, prefixUserMessageWithClock(prompt), threadId, modelOverride, timeoutMsOverride, agentName, undefined, onChunk, onToolEvent, channelId);
 }
 
 // Path where Claude Code stores session JSONL transcripts for this project
