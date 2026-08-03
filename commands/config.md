@@ -15,9 +15,13 @@ Parse `$ARGUMENTS` to identify what the user wants. If no arguments are given, s
 
    **General**
    - Model: (e.g. `opus`, `sonnet`, `haiku`, `glm` or "default")
-   - API token: (first 5 chars + "..." or "not configured"; used when `model` is `glm`)
-   - Fallback model: (e.g. `glm`, `sonnet`, or "not configured")
+   - API token: (first 5 chars + "..." or "not configured"; optional token for the primary model path)
+   - Base URL: (Anthropic-compatible endpoint or "default")
+   - Skip model flag: (yes/no)
+   - Fallback model: (e.g. `glm`, `gpt-4.1`, or "not configured")
    - Fallback API token: (first 5 chars + "..." or "not configured")
+   - Fallback base URL: (Anthropic-compatible endpoint or "default")
+   - Fallback skip model flag: (yes/no)
    - Timezone: (e.g. `America/New_York` or "UTC")
 
    **Heartbeat**
@@ -120,16 +124,16 @@ Set the Claude model to use for sessions.
 2. Otherwise, use **AskUserQuestion**: "Which Claude model should ClaudeClaw use?" (header: "Model", options: "opus (default)", "sonnet", "haiku", "glm")
 3. Read `.claude/claudeclaw/settings.json`.
 4. Set `model` to the new value.
-5. If the selected model is `glm`, ask for `api` token (unless already set) and save it to top-level `api`.
-6. If model is changed away from `glm`, keep `api` unchanged.
+5. If the selected model path needs a token, optionally set top-level `api`.
+6. If the model path uses an Anthropic-compatible proxy, optionally set top-level `baseUrl` and `skipModelFlag`.
 7. Write and confirm.
 
 ### `api <token>` / `api`
 
-Set or update the API token used when `model` is `glm`.
+Set or update the API token used for the primary model path.
 
 1. If token is in `$ARGUMENTS`, use it directly.
-2. Otherwise, use **AskUserQuestion**: "What API token should ClaudeClaw use for glm?" (header: "API token", options: let user type via Other)
+2. Otherwise, use **AskUserQuestion**: "What API token should ClaudeClaw use for the primary model path?" (header: "API token", options: let user type via Other)
 3. Read `.claude/claudeclaw/settings.json`.
 4. Set top-level `api` to the new value.
 5. Write and confirm.
@@ -139,7 +143,7 @@ Set or update the API token used when `model` is `glm`.
 Set the fallback model used when the primary model hits a rate limit.
 
 1. If fallback model name is in `$ARGUMENTS`, use it directly.
-2. Otherwise, use **AskUserQuestion**: "Which fallback model should ClaudeClaw use?" (header: "Fallback model", options: "glm (Recommended)", "sonnet", "haiku")
+2. Otherwise, use **AskUserQuestion**: "Which fallback model should ClaudeClaw use?" (header: "Fallback model", options: "glm (Recommended)", "gpt-4.1", "kimi-k2")
 3. Read `.claude/claudeclaw/settings.json`.
 4. Set `fallback.model` to the chosen value (`""` for none).
 5. Write and confirm.
@@ -153,6 +157,42 @@ Set or clear the API token for the fallback model.
 3. Read `.claude/claudeclaw/settings.json`.
 4. Set `fallback.api` to the new value.
 5. Write and confirm.
+
+### `base url <url>` / `base url`
+
+Set or clear the primary Anthropic-compatible base URL.
+
+1. If URL is in `$ARGUMENTS`, use it directly.
+2. Otherwise, use **AskUserQuestion**: "What Anthropic-compatible base URL should ClaudeClaw use for the primary model path?" (header: "Base URL", options: let user type via Other)
+3. Read `.claude/claudeclaw/settings.json`.
+4. Set top-level `baseUrl` to the new value.
+5. Write and confirm.
+
+### `fallback base url <url>` / `fallback base url`
+
+Set or clear the fallback Anthropic-compatible base URL.
+
+1. If URL is in `$ARGUMENTS`, use it directly.
+2. Otherwise, use **AskUserQuestion**: "What Anthropic-compatible base URL should ClaudeClaw use for fallback?" (header: "Fallback Base URL", options: let user type via Other)
+3. Read `.claude/claudeclaw/settings.json`.
+4. Set `fallback.baseUrl` to the new value.
+5. Write and confirm.
+
+### `skip model flag on` / `skip model flag off`
+
+Control whether ClaudeClaw omits `--model` for the primary model path.
+
+1. Read `.claude/claudeclaw/settings.json`.
+2. Set top-level `skipModelFlag` to `true` or `false`.
+3. Write and confirm.
+
+### `fallback skip model flag on` / `fallback skip model flag off`
+
+Control whether ClaudeClaw omits `--model` for fallback.
+
+1. Read `.claude/claudeclaw/settings.json`.
+2. Set `fallback.skipModelFlag` to `true` or `false`.
+3. Write and confirm.
 
 ### `timezone <tz>` / `timezone`
 
@@ -207,13 +247,17 @@ Reset all settings to defaults.
 1. Use **AskUserQuestion**: "Reset all settings to defaults? This will disable heartbeat and clear Telegram config." (header: "Confirm", options: "Yes, reset everything", "No, keep current settings")
 2. If confirmed, write the default settings:
    ```json
-   {
-     "model": "",
-     "api": "",
-     "fallback": {
-       "model": "",
-       "api": ""
-     },
+    {
+      "model": "",
+      "api": "",
+      "baseUrl": "",
+      "skipModelFlag": false,
+      "fallback": {
+        "model": "",
+        "api": "",
+        "baseUrl": "",
+        "skipModelFlag": false
+      },
      "timezone": "UTC",
      "timezoneOffsetMinutes": 0,
      "heartbeat": {
@@ -251,9 +295,13 @@ Location: `.claude/claudeclaw/settings.json`
 {
   "model": "opus",
   "api": "",
+  "baseUrl": "",
+  "skipModelFlag": false,
   "fallback": {
     "model": "glm",
-    "api": ""
+    "api": "",
+    "baseUrl": "https://api.z.ai/api/anthropic",
+    "skipModelFlag": true
   },
   "timezone": "America/New_York",
   "timezoneOffsetMinutes": -300,
@@ -286,9 +334,13 @@ Location: `.claude/claudeclaw/settings.json`
 | Key                        | Type       | Description                                    |
 |----------------------------|------------|------------------------------------------------|
 | `model`                    | string     | Claude model (`opus`, `sonnet`, `haiku`, `glm`, or full ID). Empty = default |
-| `api`                      | string     | API token used when model is `glm` (mapped to `ANTHROPIC_AUTH_TOKEN`) |
-| `fallback.model`           | string     | Backup model used automatically if primary run returns rate-limit text (recommend `glm` for provider diversity) |
+| `api`                      | string     | API token used for the primary Anthropic-compatible path (mapped to `ANTHROPIC_AUTH_TOKEN`) |
+| `baseUrl`                  | string     | Optional Anthropic-compatible base URL for the primary model path |
+| `skipModelFlag`            | boolean    | When `true`, ClaudeClaw omits `--model` for the primary path |
+| `fallback.model`           | string     | Backup model used automatically if the primary run returns rate-limit text |
 | `fallback.api`             | string     | API token used with `fallback.model` (optional) |
+| `fallback.baseUrl`         | string     | Optional Anthropic-compatible base URL for fallback |
+| `fallback.skipModelFlag`   | boolean    | When `true`, ClaudeClaw omits `--model` for fallback |
 | `timezone`                 | string     | IANA timezone name (e.g. `America/New_York`)   |
 | `timezoneOffsetMinutes`    | number     | UTC offset in minutes (auto-resolved from timezone) |
 | `heartbeat.enabled`        | boolean    | Whether the recurring heartbeat runs           |
