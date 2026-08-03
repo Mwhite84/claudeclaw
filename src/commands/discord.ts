@@ -1143,9 +1143,7 @@ const pendingForwards = new Map<string, { snapshot: DiscordMessageSnapshot; time
 async function handleMessageCreate(token: string, message: DiscordMessage, skipCoalesce = false): Promise<void> {
   const config = getSettings().discord;
 
-  // Ignore bot messages and system thread-creation notifications (type 21)
   if (message.author.bot) return;
-  if (message.type === 21) return;
 
   // Ignore system message types (thread creation recap, pins, etc.) — only process
   // regular messages (0) and replies (19) to avoid spurious prompts on the parent channel.
