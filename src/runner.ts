@@ -37,6 +37,7 @@ import { selectModel } from "./model-router";
 import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
 import { getPluginManager, type EventContext } from "./plugins";
 import { recall, isSubstantive, getProjectSlug } from "./hindsight";
+import { consumeHandoffFile } from "./session-reader";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 const ACTIVE_RUNS_FILE = join(process.cwd(), ".claude/claudeclaw/active-runs");
@@ -1174,6 +1175,18 @@ async function execClaude(
   ];
 
   if (rotationSummary) appendParts.push(`Context from the previous session:\n\n${rotationSummary}`);
+
+  // Session context handoff: when a new Discord channel/thread session starts,
+  // check for a handoff file written by /attach. If present, inject the transcript
+  // context into the system prompt and delete the file (one-shot consumption).
+  if (isNew && (threadId || channelId)) {
+    const handoffScopeId = threadId ?? channelId!;
+    const handoffContent = consumeHandoffFile(handoffScopeId);
+    if (handoffContent) {
+      appendParts.push(handoffContent);
+      console.log(`[${new Date().toLocaleTimeString()}] [handoff] Injected session context for ${threadId ? "thread" : "channel"} ${handoffScopeId.slice(0, 8)}`);
+    }
+  }
 
   try {
     const claudeMd = await Bun.file(PROJECT_CLAUDE_MD).text();
