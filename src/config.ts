@@ -151,6 +151,7 @@ export interface DiscordConfig {
    *  Threads inherit their parent channel's bindings.
    *  Map: channelId (Discord snowflake string) -> array of skill names. */
   channelSkills?: Record<string, string[]>;
+  channelAllowedUserIds?: Record<string, string[]>; // channelId -> extra user IDs allowed in that guild channel only (never DMs)
 }
 
 export interface SlackConfig {
@@ -437,6 +438,13 @@ function parseSettings(
             ),
           }
         : {}),
+      channelAllowedUserIds: raw.discord?.channelAllowedUserIds && typeof raw.discord.channelAllowedUserIds === "object"
+        ? Object.fromEntries(
+            Object.entries(raw.discord.channelAllowedUserIds as Record<string, unknown>)
+              .filter(([, v]) => Array.isArray(v))
+              .map(([k, v]) => [String(k), (v as unknown[]).map(String)]),
+          )
+        : undefined,
     },
     slack: {
       botToken: process.env.SLACK_BOT_TOKEN?.trim() || (typeof raw.slack?.botToken === "string" ? raw.slack.botToken.trim() : ""),

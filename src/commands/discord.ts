@@ -1,21 +1,21 @@
 import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, compactCurrentThreadSession, compactCurrentChannelSession, agentDirKey, claudeSessionExists } from "../runner";
 import { readSessionTranscript, buildContextHandoff, writeHandoffFile } from "../session-reader";
 import { wrapUntrusted } from "../prompt-safety";
-import { isAllowed } from "../allowlist";
+import { isAllowed, isDiscordAuthorized } from "../allowlist";
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
 import { getSettings, loadSettings, DEFAULT_IMAGE_OUTPUT_ROOT } from "../config";
 import { resetSession, resetFallbackSession, resetAllScopedFallbackSessions, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession, createThreadSession, getChannelSession, createChannelSession, removeChannelSession, peekChannelSession, countChannelSessions, clearAllSessions, listDiscordSessions } from "../sessionManager";
 import { readFile } from "node:fs/promises";
-import { existsSync, realpathSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { realpathSync, statSync } from "node:fs";
+import { findSessionJsonlPath } from "../sessionFiles";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
 import { mkdir } from "node:fs/promises";
 import { extname, join, basename, sep } from "node:path";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
-import { flushSessionToHindsight, retain, pollOperationUntilComplete, readRecentTranscriptTail, getProjectSlug, type FlushMetadata } from "../hindsight";
+import { flushSessionToHindsight, retain, pollOperationUntilComplete, readRecentTranscriptTail, type FlushMetadata } from "../hindsight";
 import { classifyMemo } from "../classify";
 
 // --- Discord API constants ---
@@ -81,6 +81,12 @@ interface DiscordMessage {
   flags?: number;
   type: number;
   thread_id?: string; // present when message is in a thread
+}
+
+const enum DiscordMessageType {
+  Default = 0,
+  Reply = 19,
+  ThreadCreated = 18,
 }
 
 interface DiscordInteraction {
@@ -1141,6 +1147,10 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
   if (message.author.bot) return;
   if (message.type === 21) return;
 
+  // Ignore system message types (thread creation recap, pins, etc.) — only process
+  // regular messages (0) and replies (19) to avoid spurious prompts on the parent channel.
+  if (message.type !== DiscordMessageType.Default && message.type !== DiscordMessageType.Reply) return;
+
   const userId = message.author.id;
   const channelId = message.channel_id;
   const isDM = !message.guild_id;
@@ -1199,8 +1209,9 @@ async function handleMessageCreate(token: string, message: DiscordMessage, skipC
     `Handle message channel=${channelId} from=${userId} reason=${triggerReason} text="${content.slice(0, 80)}"`,
   );
 
-  // Authorization check
-  if (!isAllowed(userId, config.allowedUserIds)) {
+  // Authorization check — global allowlist works everywhere; channel-scoped allowlist only
+  // grants access to guild messages in that specific channel, never DMs.
+  if (!isDiscordAuthorized(userId, isGuild, channelId, config.allowedUserIds, config.channelAllowedUserIds)) {
     if (isDM) {
       await sendMessage(config.token, channelId, "Unauthorized.");
     } else {
@@ -1822,10 +1833,8 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
         await respondToInteraction(interaction, { content: "No active session." });
         return;
       }
-      const home = homedir();
-      const projectSlug = getProjectSlug();
-      const jsonlPath = `${home}/.claude/projects/${projectSlug}/${session.sessionId}.jsonl`;
-      if (!existsSync(jsonlPath)) {
+      const jsonlPath = findSessionJsonlPath(session.sessionId);
+      if (!jsonlPath) {
         await respondToInteraction(interaction, { content: "Conversation file not found." });
         return;
       }
